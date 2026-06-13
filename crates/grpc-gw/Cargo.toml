@@ -11,7 +11,14 @@ description = "Dynamic gRPC↔JSON transcoding reverse proxy in the spirit of gr
 name = "grpc_gw"
 path = "src/lib.rs"
 
+[[bin]]
+name = "grpc-gw"
+path = "src/bin/grpc-gw.rs"
+
 [dependencies]
 prost.workspace = true
 prost-reflect.workspace = true
 prost-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
