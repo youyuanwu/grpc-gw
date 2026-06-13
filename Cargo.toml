@@ -17,7 +17,10 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 bytes = "1"
 http = "1"
-tokio = { version = "1", features = ["rt", "net", "io-util"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time"] }
 # Client transport only: `channel` pulls the hyper-util client + tower balance,
 # not the server/router (which `transport` would add).
 tonic = { version = "0.14", default-features = false, features = ["channel"] }

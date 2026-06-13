@@ -24,13 +24,15 @@ serde_json.workspace = true
 clap.workspace = true
 bytes.workspace = true
 http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
-# The proxy integration test stands up a minimal HTTP/2 gRPC backend with hyper
-# (no tonic server) to prove real wire interop.
+# The proxy/gateway integration tests stand up a minimal HTTP/2 gRPC backend
+# with hyper (no tonic server) to prove real wire interop, and a small h1
+# client to drive `serve_connection`.
 tokio = { version = "1", features = ["full"] }
-hyper = { version = "1", features = ["server", "http2"] }
-hyper-util = { version = "0.1", features = ["server", "tokio"] }
-http-body-util = "0.1"
+hyper = { version = "1", features = ["client"] }
