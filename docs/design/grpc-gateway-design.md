@@ -1,16 +1,18 @@
 # grpc-gw — Rust gRPC-Gateway design
 
 A Rust gRPC↔JSON transcoding reverse proxy in the spirit of Go's
-[grpc-gateway](https://github.com/grpc-ecosystem/grpc-gateway), built on the
-[`protobuf`](https://crates.io/crates/protobuf) crate (rust-protobuf) — **not
-prost / tonic**.
+[grpc-gateway](https://github.com/grpc-ecosystem/grpc-gateway), built on
+[`prost`](https://crates.io/crates/prost) +
+[`prost-reflect`](https://crates.io/crates/prost-reflect) for runtime
+reflection and dynamic messages — the mainstream, actively-maintained protobuf
+stack that also underpins `tonic`.
 
 This document is the architectural counterpart to the
 [`tonic-rest` background note](../background/tonic-rest.md). Where `tonic-rest`
 code-generates per-service Axum handlers that call Tonic traits in-process,
 `grpc-gw` is an **out-of-process, fully dynamic proxy** that transcodes via
-runtime reflection. The two solve overlapping problems with opposite
-trade-offs; the "Why not tonic-rest / prost" section explains the split.
+runtime reflection — no per-service codegen. The two solve overlapping problems
+with opposite trade-offs.
 
 ## Goals
 
@@ -38,27 +40,44 @@ trade-offs; the "Why not tonic-rest / prost" section explains the split.
   awkward for these; defer).
 - gRPC-Web framing (different concern; can layer later).
 
-## Why the `protobuf` crate (and not prost)
+## Why `prost` + `prost-reflect`
 
-rust-protobuf ships exactly the runtime machinery a dynamic gateway needs,
-which prost deliberately does not:
+A dynamic gateway needs runtime reflection, dynamic (typeless) messages, and
+canonical proto3 JSON. Plain `prost` is codegen-only and provides none of
+these, but [`prost-reflect`](https://crates.io/crates/prost-reflect) adds
+exactly that layer on top of the prost runtime:
 
-| Capability we need                | `protobuf` (rust-protobuf)                              | prost / tonic                                  |
-| --------------------------------- | ------------------------------------------------------ | ---------------------------------------------- |
-| Runtime reflection                | [`protobuf::reflect`](https://docs.rs/protobuf/latest/protobuf/reflect/index.html) — `FileDescriptor`, `MessageDescriptor`, `FieldDescriptor` | none (codegen-only structs)                    |
-| Dynamic messages (no Rust type)   | `MessageDyn` + dynamic message built from a descriptor | none — every message is a concrete generated struct |
-| Canonical proto3 JSON             | [`protobuf-json-mapping`](https://crates.io/crates/protobuf-json-mapping) (`parse_dyn_from_str`, `print_to_string`) | not provided; `prost` needs `prost-reflect` + hand-rolled JSON |
-| Descriptor-set parsing            | [`protobuf::descriptor::FileDescriptorSet`](https://docs.rs/protobuf/latest/protobuf/descriptor/struct.FileDescriptorSet.html) — parse a pre-built `.pb`, no `protoc` at runtime | `prost-build` (codegen-focused)                |
-| Read/write fields by name at runtime | `ReflectValueRef` / `ReflectValueBox` via `FieldDescriptor` | not possible without generated accessors       |
+| Capability we need                | `prost` + `prost-reflect`                                                                 |
+| --------------------------------- | ---------------------------------------------------------------------------------------- |
+| Runtime reflection                | `DescriptorPool`, `MessageDescriptor`, `FieldDescriptor`, `ServiceDescriptor`, `MethodDescriptor` |
+| Dynamic messages (no Rust type)   | `DynamicMessage` — encode/decode/reflect an arbitrary message from its descriptor         |
+| Canonical proto3 JSON             | `DynamicMessage` serde impl (`SerializeOptions` / `DeserializeOptions`, `serde` feature)  |
+| Descriptor-set parsing            | `DescriptorPool::decode` / `from_file_descriptor_set` — parse a pre-built `.pb`, no `protoc` at runtime |
+| Read/write fields at runtime      | `get_field` / `set_field` with `Value`, by name or number                                |
+| Custom-option (extension) reads   | `ExtensionDescriptor` + `DynamicMessage::get_extension` — reads `google.api.http` directly |
 
 Because messages are **dynamic**, the gateway never compiles in knowledge of
-any specific service. The same binary transcodes any backend whose descriptor
-set it is handed. prost would force us to code-generate a concrete struct for
-every message and then re-implement reflection and proto3 JSON on top — i.e.
-reinvent what rust-protobuf already ships.
+any specific service: the same binary transcodes any backend whose descriptor
+set it is handed. The proxy also never needs typed gRPC stubs — it forwards
+**opaque encoded bytes** over HTTP/2, so tonic's generated client is
+unnecessary on the hot path.
 
-The proxy also never needs typed gRPC stubs: it forwards **opaque encoded
-bytes** over HTTP/2, so tonic's prost-bound client is unnecessary.
+Why this over rust-protobuf (the `protobuf` crate), which offers a similar
+reflection API:
+
+- **Actively maintained & mainstream.** `prost`/`prost-reflect` track current
+  releases and are the ecosystem default; rust-protobuf's pure-Rust line is
+  effectively frozen (its maintainer donated the `protobuf` name to Google,
+  whose v4 successor is a C/upb-backed beta with **no** reflection at all).
+- **First-class extension reads.** `ExtensionDescriptor` reads the
+  `google.api.http` custom option by name — no generated annotation types and
+  no hand-decoding of unknown fields.
+- **`tonic` interop.** `DynamicMessage::transcode_to`/`transcode_from` bridge
+  to generated prost types, which makes the
+  [co-hosting](./co-hosting-with-tonic.md) story clean.
+
+Trade-off: `prost-reflect` is pre-1.0 (`0.16.x`), so minor bumps may be
+breaking; we pin a compatible range and absorb upgrades deliberately.
 
 ## High-level architecture
 
@@ -74,7 +93,7 @@ bytes** over HTTP/2, so tonic's prost-bound client is unnecessary.
         ┌───────────────────────┐     ┌────────────────────────┐
         │   Router / matcher     │◄────│  Descriptor registry   │
         │  (google.api.http)     │     │  FileDescriptorSet →    │
-        └───────────┬───────────┘     │  reflect::FileDescriptor│
+        └───────────┬───────────┘     │  prost DescriptorPool   │
                     │                  └────────────────────────┘
                     ▼
         ┌───────────────────────┐
@@ -122,27 +141,30 @@ grpc-gw/
 
 | Module          | Role                                                                    | Key deps                                  |
 | --------------- | ----------------------------------------------------------------------- | ----------------------------------------- |
-| `descriptor`    | Descriptor registry, route table, path-template matcher, http-rule model | `protobuf`                                |
-| `transcode`     | Request/response transcoding (JSON ⇄ dynamic message, query/path binding) | `protobuf`, `protobuf-json-mapping`, `serde_json` |
+| `descriptor`    | Descriptor registry, route table, path-template matcher, http-rule model | `prost-reflect`, `prost-types`            |
+| `transcode`     | Request/response transcoding (JSON ⇄ dynamic message, query/path binding) | `prost-reflect` (`serde`), `prost`, `serde_json` |
 | `proxy`         | `GrpcClient`: gRPC framing/status mapping over a `hyper_util` h2 `Client` (pluggable connector) | `hyper`, `hyper-util`, `http`, `tokio`, `bytes` |
 | `server`        | Byte-stream `serve_connection` (HTTP decode) + tower middleware binding the `Gateway` service (no socket/TLS/config) | `hyper`, `hyper-util`, `tower`, `tower-http`, `tokio`   |
-| `openapi`       | Descriptor registry → OpenAPI/Swagger document (see [openapi-generation.md](./openapi-generation.md)) | `protobuf`, `serde`, `serde_json` |
+| `openapi`       | Descriptor registry → OpenAPI/Swagger document (see [openapi-generation.md](./openapi-generation.md)) | `prost-reflect`, `serde`, `serde_json` |
 | `bin/grpc-gw`   | Thin `main` that wires the above into a runnable gateway binary          | the crate's own lib                       |
 | `bin/grpc-gw-openapi` | Thin `main` that loads a `.pb` and emits an OpenAPI/Swagger spec   | the crate's own lib                       |
 
 The gateway consumes only a **pre-built `FileDescriptorSet`** (a `.pb`), which
-parses with `protobuf::descriptor` from the `protobuf` crate itself — so there
-is **no `protobuf-parse` dependency and no `protoc` invocation at runtime**.
-TLS is never owned by the core: it is applied by the caller as a byte-stream
-adapter (see [Tier 1](#tier-1--raw-byte-streams-rest-in-grpc-out)). Optional/
-heavier dependencies are gated behind Cargo features rather than separate
-crates — e.g. a convenience `tls` feature wiring `tokio-rustls` helpers for the
+parses with `prost_reflect::DescriptorPool::decode` (which uses `prost` to
+decode the descriptor messages) — so there is **no `protoc` invocation and no
+`.proto` parsing at runtime**. TLS is never owned by the core: it is applied by
+the caller as a byte-stream adapter (see
+[Tier 1](#tier-1--raw-byte-streams-rest-in-grpc-out)). Optional/heavier
+dependencies are gated behind Cargo features rather than separate crates —
+e.g. a convenience `tls` feature wiring `tokio-rustls` helpers for the
 `bin/grpc-gw` target — so embedders can opt out (and bring their own TLS)
 without a crate split.
 
 `google.api.http` lives in the descriptor's `MethodOptions` as extension
-field **72295728**; we read it via the `protobuf::ext` / extension APIs rather
-than depending on a generated `annotations.rs`.
+field **72295728**; we read it by resolving the extension by name
+(`DescriptorPool::get_extension_by_name("google.api.http")`) and reading it off
+the method's options via `DynamicMessage::get_extension` — no generated
+`annotations.rs`.
 
 ## Library API boundary (streams, not config)
 
@@ -322,18 +344,19 @@ the gateway parses the same compiled descriptor form and still never runs
 
 `--descriptor-set path.pb` / `descriptor_set = "…"`. Produced offline by
 `protoc --include_imports --include_source_info -o set.pb …` (or `buf build
--o set.pb`). Parsed at startup with
-`protobuf::descriptor::FileDescriptorSet::parse_from_bytes`, then loaded into a
-`reflect::FileDescriptor` registry resolving imports in dependency order.
+-o set.pb`). Parsed at startup with `prost_reflect::DescriptorPool::decode`,
+which builds a pool resolving imports in dependency order.
 `--include_imports` is required so the set is self-contained (carries
-`google/api/http.proto` and all transitive deps).
+`google/api/http.proto`, `google/api/annotations.proto` — so the
+`google.api.http` extension is registered in the pool — and all transitive
+deps).
 
 Why `.pb` (when you choose it over reflection):
 
-- **No runtime `protoc`.** Parsing uses stable `protobuf::descriptor` types
-  from the `protobuf` crate; nothing is compiled on the host at startup.
-- **No `protobuf-parse` dependency** (whose README warns it has "no stable
-  API").
+- **No runtime `protoc`.** Parsing decodes the `FileDescriptorSet` with
+  `prost`/`prost-reflect`; nothing is compiled on the host at startup.
+- **No `.proto` parsing.** The pool is built from the compiled descriptor
+  form, so there is no `.proto` source parser in the runtime dependency tree.
 - **Self-contained & reproducible.** One artifact carries the whole schema
   including imports; no include-path resolution or vendored `.proto` trees at
   runtime, and the deploy does not depend on backend availability.
@@ -351,7 +374,7 @@ The result is a `DescriptorRegistry`:
 
 ```rust
 pub struct DescriptorRegistry {
-    files: Vec<protobuf::reflect::FileDescriptor>,
+    pool: prost_reflect::DescriptorPool,
     // method full-name → resolved binding(s)
     routes: Vec<Route>,
 }
@@ -360,8 +383,8 @@ pub struct Route {
     pub service: String,                 // package.Service
     pub method: String,                  // Method
     pub grpc_path: String,               // "/package.Service/Method"
-    pub input: protobuf::reflect::MessageDescriptor,
-    pub output: protobuf::reflect::MessageDescriptor,
+    pub input: prost_reflect::MessageDescriptor,
+    pub output: prost_reflect::MessageDescriptor,
     pub server_streaming: bool,
     pub bindings: Vec<HttpBinding>,      // primary + additional_bindings
 }
@@ -446,16 +469,17 @@ to expose only explicitly annotated methods.
 Given a matched `Route` + `HttpBinding`, build the **input dynamic message**:
 
 ```rust
-let mut msg = route.input.new_instance();   // dynamic message (Box<dyn MessageDyn>)
+let mut msg = DynamicMessage::new(route.input.clone());   // empty dynamic message
 ```
 
 Population order (later steps override earlier, matching grpc-gateway):
 
 1. **Body.** Depending on `BodySelector`:
-   - `Wildcard` (`body: "*"`): parse the whole HTTP body as JSON into `msg`
-     with `protobuf_json_mapping::merge_from_str` (uses the descriptor; honors
-     proto3 JSON rules).
-   - `Field(path)` (`body: "field"`): parse the body as JSON into the
+   - `Wildcard` (`body: "*"`): deserialize the whole HTTP body as proto3 JSON
+     into `msg` with
+     `DynamicMessage::deserialize(route.input.clone(), &mut serde_json_de)`
+     (descriptor-driven; honors proto3 JSON rules via the `serde` feature).
+   - `Field(path)` (`body: "field"`): deserialize the body as JSON into the
      sub-message/field located by `path`, then assign via reflection. This is
      the selector `tonic-rest` rejects; we support it.
    - `None`: skip body (GET / DELETE without a body).
@@ -468,9 +492,10 @@ Population order (later steps override earlier, matching grpc-gateway):
 3. **Path variables.** Captures from `PathTemplate` are written last into
    their target field paths via reflection (single- or multi-segment).
 
-All field writes go through `FieldDescriptor` + `ReflectValueBox`, so no
-message type is known at compile time. Type/precision coercion (e.g. string→
-`int64`, name→enum) is centralized in `grpc-gw-json::coerce`.
+All field writes go through `FieldDescriptor` + `prost_reflect::Value`
+(`set_field` / `try_set_field`), so no message type is known at compile time.
+Type/precision coercion (e.g. string→`int64`, name→enum) is centralized in a
+`transcode::coerce` helper.
 
 ## gRPC client & framing
 
@@ -479,7 +504,8 @@ hand-roll an h2 client: it uses a `hyper_util::client::legacy::Client` in
 `http2_only` mode (which owns the handshake, per-authority pooling, and stream
 multiplexing) and adds only the gRPC framing on top.
 
-1. Serialize the input dynamic message: `msg.write_to_bytes_dyn()`.
+1. Serialize the input dynamic message: `msg.encode_to_vec()` (the
+   `prost::Message` impl on `DynamicMessage`).
 2. Frame it: 1 compression byte (`0`) + 4-byte big-endian length + payload.
 3. Send a `POST {grpc_path}` request through the hyper-util `Client` (which
    borrows/opens a pooled h2 connection via its connector) with:
@@ -487,9 +513,9 @@ multiplexing) and adds only the gRPC framing on top.
    - `te: trailers`
    - forwarded metadata headers (see below).
 4. Stream request frame(s) as the request body.
-5. Read response data frames off the response body, de-frame, and parse into
-   the **output dynamic message**: `route.output.parse_from_bytes(payload)`
-   (via descriptor).
+5. Read response data frames off the response body, de-frame, and decode into
+   the **output dynamic message**: `DynamicMessage::decode(route.output.clone(),
+   payload)`.
 6. Read the trailing `grpc-status` / `grpc-message` (and `grpc-status-details-bin`
    for `google.rpc.Status` details) from the response's trailer frame. Map to
    HTTP.
@@ -525,9 +551,10 @@ embedders override for full control:
 2. If the binding has a `response_body` selector, narrow to that field.
 3. Pick the marshaler for the negotiated `Accept` (default canonical proto3
    JSON via the [`Marshaler` hook](#pluggable-hooks)) and serialize \u2014 for JSON,
-   [`protobuf_json_mapping::print_to_string_with_options`](https://docs.rs/protobuf-json-mapping/latest/protobuf_json_mapping/fn.print_to_string_with_options.html)
-   configured by `GatewayOptions` (proto field names vs. `json_name`,
-   `emit_default_values`, `enum_as_integer`).
+   `DynamicMessage::serialize_with_options` with `prost_reflect::SerializeOptions`
+   configured by `GatewayOptions` (proto field names vs. `json_name` via
+   `use_proto_field_name`, `skip_default_fields`, `stringify_64_bit_integers`,
+   enum-as-name vs. number).
 4. `200 OK`, with the marshaler's `content-type` (`application/json` default).
 
 ### Status & error mapping
@@ -778,7 +805,7 @@ Target parity (contrast with the `tonic-rest` row in
 | `additional_bindings`        | Supported                                      | Supported                    |
 | `body: "field"`              | Supported                                      | Supported                    |
 | Query param field paths      | Full `?a.b=c` reflection expansion             | Full expansion               |
-| JSON codec                   | proto3 canonical (`protobuf-json-mapping`)     | proto3 canonical (`protojson`) |
+| JSON codec                   | proto3 canonical (`prost-reflect` serde)       | proto3 canonical (`protojson`) |
 | WKT / enums / int64          | Canonical (string int64, enum names, RFC 3339) | Canonical                    |
 | Error envelope               | Status-proto JSON (`code`/`message`/`details`) | Status-proto JSON            |
 | Custom marshaler (per MIME)  | `Marshaler` hook, `Accept`-negotiated           | `WithMarshalerOption`        |
@@ -797,15 +824,18 @@ transcoding.
 
 - **Schema sources.** The gateway loads descriptors from a pre-built `.pb`
   **or** gRPC server reflection and never runs `protoc` / parses `.proto` at
-  runtime, so it depends only on the stable `protobuf::descriptor` types (no
-  `protobuf-parse`). The `.pb` path needs the operator to produce and sync the
+  runtime, so it depends only on `prost`/`prost-reflect` to decode the
+  descriptor set. The `.pb` path needs the operator to produce and sync the
   artifact (the `check` command gates it); the reflection path couples startup
   to backend availability and requires the reflection service exposed.
-- **Reading the `google.api.http` extension.** Confirm the extension-decoding
-  ergonomics in `protobuf::ext` for custom options on `MethodOptions`; worst
-  case, decode the raw `UnknownFields` of `MethodOptions` for field 72295728.
-  This is on the critical path for M1/M2 (the whole route table depends on it),
-  so de-risk it first.
+- **Reading the `google.api.http` extension** — **resolved in Spike 0.**
+  `prost-reflect` reads the custom option directly:
+  `DescriptorPool::get_extension_by_name("google.api.http")` +
+  `DynamicMessage::get_extension` on the method options. Requires the `.pb` to
+  carry `google/api/annotations.proto` (i.e. built with `--include_imports`).
+  See [m1-scope.md](./m1-scope.md).
+- **`prost-reflect` is pre-1.0 (`0.16.x`).** Minor bumps may be breaking; pin a
+  compatible range and upgrade deliberately.
 - **Dynamic message performance.** Reflection-based encode/decode is slower
   than monomorphized prost structs. Acceptable for a gateway (I/O-bound), but
   benchmark; cache per-route descriptor lookups and template matchers.
@@ -840,8 +870,8 @@ transcoding.
 - `tonic-rest` background: [docs/background/tonic-rest.md](../background/tonic-rest.md)
 - M1 buildable scope: [m1-scope.md](./m1-scope.md)
 - OpenAPI/Swagger generation: [openapi-generation.md](./openapi-generation.md)
-- [`protobuf`](https://crates.io/crates/protobuf) /
-  [`reflect` module](https://docs.rs/protobuf/latest/protobuf/reflect/index.html)
-- [`protobuf-json-mapping`](https://crates.io/crates/protobuf-json-mapping)
+- [`prost`](https://crates.io/crates/prost) /
+  [`prost-reflect`](https://crates.io/crates/prost-reflect)
+  ([`DynamicMessage`](https://docs.rs/prost-reflect/latest/prost_reflect/struct.DynamicMessage.html))
 - [google.api.http transcoding spec](https://cloud.google.com/endpoints/docs/grpc/transcoding)
 - [grpc-gateway](https://github.com/grpc-ecosystem/grpc-gateway)

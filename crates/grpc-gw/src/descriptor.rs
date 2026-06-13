@@ -4,23 +4,23 @@
 //! reading the `google.api.http` annotation off a runtime-loaded descriptor
 //! set *without* any generated `annotations.rs`.
 //!
-//! ## Why we decode unknown fields instead of using `protobuf::ext`
+//! With `prost-reflect`, this is a first-class reflection operation:
 //!
-//! `protobuf::ext` is a "stopgap" that needs a generated
-//! `ExtFieldOptional<MethodOptions, HttpRule>` constant — i.e. codegen of
-//! `google/api/annotations.proto`. That conflicts with the design goal of
-//! depending only on the stable `protobuf::descriptor` types. When the
-//! `protobuf` crate parses a `FileDescriptorSet`, the `(google.api.http)`
-//! option (`MethodOptions` extension field **72295728**) is unknown to the
-//! generated `MethodOptions` struct, so it is preserved verbatim in that
-//! message's `UnknownFields` as a length-delimited blob — the serialized
-//! `HttpRule`. We read that blob and hand-decode the few `HttpRule` fields we
-//! need. No `protoc`, no generated annotations.
+//! - [`DescriptorPool::decode`] parses a `FileDescriptorSet` (`.pb`).
+//! - [`prost_reflect::MethodDescriptor::options`] returns a [`DynamicMessage`]
+//!   of the method's `MethodOptions`, **including extension fields**.
+//! - The `(google.api.http)` option is resolved by name via
+//!   [`DescriptorPool::get_extension_by_name`] and read with
+//!   [`DynamicMessage::get_extension`].
+//!
+//! The descriptor set must include `google/api/annotations.proto` (build it
+//! with `protoc --include_imports`) so the extension definition is present in
+//! the pool. No `protoc` at runtime, no generated annotation types.
 
-use protobuf::descriptor::FileDescriptorSet;
-use protobuf::CodedInputStream;
-use protobuf::Message;
-use protobuf::UnknownValueRef;
+use prost_reflect::{DescriptorPool, DynamicMessage, ExtensionDescriptor};
+
+/// Fully-qualified name of the `google.api.http` method extension.
+pub const HTTP_RULE_EXTENSION: &str = "google.api.http";
 
 /// `MethodOptions` extension field number for `google.api.http`.
 pub const HTTP_RULE_FIELD_NUMBER: u32 = 72295728;
@@ -87,137 +87,142 @@ pub struct MethodHttp {
     pub http_rule: Option<HttpRule>,
 }
 
+/// Error returned while loading a descriptor set.
+#[derive(Debug)]
+pub enum DescriptorError {
+    /// The `FileDescriptorSet` bytes failed to decode into a pool.
+    Decode(prost_reflect::DescriptorError),
+}
+
+impl std::fmt::Display for DescriptorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DescriptorError::Decode(e) => write!(f, "failed to decode descriptor set: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for DescriptorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DescriptorError::Decode(e) => Some(e),
+        }
+    }
+}
+
+impl From<prost_reflect::DescriptorError> for DescriptorError {
+    fn from(e: prost_reflect::DescriptorError) -> Self {
+        DescriptorError::Decode(e)
+    }
+}
+
 /// Parse a serialized `FileDescriptorSet` and extract every method's
 /// `google.api.http` rule (when present).
 ///
 /// This is the Spike 0 entry point: it proves we can route off annotations
-/// loaded from a `.pb` with no generated annotation types.
-pub fn extract_http_rules(descriptor_set: &[u8]) -> protobuf::Result<Vec<MethodHttp>> {
-    let fds = FileDescriptorSet::parse_from_bytes(descriptor_set)?;
+/// loaded from a `.pb` using `prost-reflect` reflection, with no generated
+/// annotation types.
+pub fn extract_http_rules(descriptor_set: &[u8]) -> Result<Vec<MethodHttp>, DescriptorError> {
+    let pool = DescriptorPool::decode(descriptor_set)?;
+    // The extension is resolved once from the pool; it is `None` if the set was
+    // built without `google/api/annotations.proto` (no `--include_imports`).
+    let http_ext = pool.get_extension_by_name(HTTP_RULE_EXTENSION);
+
     let mut out = Vec::new();
+    for service in pool.services() {
+        for method in service.methods() {
+            let grpc_path = format!("/{}/{}", service.full_name(), method.name());
+            let http_rule = http_ext
+                .as_ref()
+                .and_then(|ext| extract_rule(&method.options(), ext));
 
-    for file in &fds.file {
-        let package = file.package();
-        for service in &file.service {
-            let service_fqn = if package.is_empty() {
-                service.name().to_string()
-            } else {
-                format!("{}.{}", package, service.name())
-            };
-
-            for method in &service.method {
-                let grpc_path = format!("/{}/{}", service_fqn, method.name());
-                let http_rule = method
-                    .options
-                    .as_ref()
-                    .and_then(|opts| {
-                        opts.special_fields
-                            .unknown_fields()
-                            .get(HTTP_RULE_FIELD_NUMBER)
-                    })
-                    .map(|value| match value {
-                        UnknownValueRef::LengthDelimited(bytes) => decode_http_rule(bytes),
-                        other => Err(protobuf::Error::from(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "google.api.http (field {HTTP_RULE_FIELD_NUMBER}) had unexpected \
-                                 wire type: {other:?}"
-                            ),
-                        ))),
-                    })
-                    .transpose()?;
-
-                out.push(MethodHttp {
-                    service: service_fqn.clone(),
-                    method: method.name().to_string(),
-                    grpc_path,
-                    server_streaming: method.server_streaming(),
-                    http_rule,
-                });
-            }
+            out.push(MethodHttp {
+                service: service.full_name().to_string(),
+                method: method.name().to_string(),
+                grpc_path,
+                server_streaming: method.is_server_streaming(),
+                http_rule,
+            });
         }
     }
 
     Ok(out)
 }
 
-/// Hand-decode an `HttpRule` message from its raw protobuf bytes.
-///
-/// `HttpRule` field numbers (from `google/api/http.proto`):
-/// 1 selector, 2 get, 3 put, 4 post, 5 delete, 6 patch, 7 body,
-/// 8 custom (CustomHttpPattern), 11 additional_bindings, 12 response_body.
-fn decode_http_rule(bytes: &[u8]) -> protobuf::Result<HttpRule> {
-    let mut is = CodedInputStream::from_bytes(bytes);
-    let mut rule = HttpRule::default();
-
-    while let Some(tag) = is.read_raw_tag_or_eof()? {
-        let field_number = tag >> 3;
-        let wire_type = tag & 0x7;
-        match field_number {
-            1 => rule.selector = is.read_string()?,
-            2 => rule.pattern = Some(HttpPattern::Get(is.read_string()?)),
-            3 => rule.pattern = Some(HttpPattern::Put(is.read_string()?)),
-            4 => rule.pattern = Some(HttpPattern::Post(is.read_string()?)),
-            5 => rule.pattern = Some(HttpPattern::Delete(is.read_string()?)),
-            6 => rule.pattern = Some(HttpPattern::Patch(is.read_string()?)),
-            7 => rule.body = is.read_string()?,
-            8 => {
-                let nested = is.read_bytes()?;
-                let (kind, path) = decode_custom_pattern(&nested)?;
-                rule.pattern = Some(HttpPattern::Custom(kind, path));
-            }
-            11 => {
-                let nested = is.read_bytes()?;
-                rule.additional_bindings.push(decode_http_rule(&nested)?);
-            }
-            12 => rule.response_body = is.read_string()?,
-            _ => skip_field(&mut is, wire_type)?,
-        }
+/// Read the `google.api.http` extension off a `MethodOptions` dynamic message,
+/// returning `None` when the method is unannotated.
+fn extract_rule(options: &DynamicMessage, ext: &ExtensionDescriptor) -> Option<HttpRule> {
+    if !options.has_extension(ext) {
+        return None;
     }
-
-    Ok(rule)
+    let value = options.get_extension(ext);
+    let rule_msg = value.as_message()?;
+    Some(http_rule_from_message(rule_msg))
 }
 
-/// Decode `CustomHttpPattern { string kind = 1; string path = 2; }`.
-fn decode_custom_pattern(bytes: &[u8]) -> protobuf::Result<(String, String)> {
-    let mut is = CodedInputStream::from_bytes(bytes);
-    let mut kind = String::new();
-    let mut path = String::new();
+/// Lower an `HttpRule` `DynamicMessage` into our [`HttpRule`] (recursive for
+/// `additional_bindings`).
+fn http_rule_from_message(msg: &DynamicMessage) -> HttpRule {
+    let mut rule = HttpRule {
+        selector: string_field(msg, "selector"),
+        body: string_field(msg, "body"),
+        response_body: string_field(msg, "response_body"),
+        ..HttpRule::default()
+    };
 
-    while let Some(tag) = is.read_raw_tag_or_eof()? {
-        let field_number = tag >> 3;
-        let wire_type = tag & 0x7;
-        match field_number {
-            1 => kind = is.read_string()?,
-            2 => path = is.read_string()?,
-            _ => skip_field(&mut is, wire_type)?,
+    // The `pattern` oneof: exactly one of these is set on a valid rule.
+    rule.pattern = pattern_field(msg, "get", HttpPattern::Get)
+        .or_else(|| pattern_field(msg, "put", HttpPattern::Put))
+        .or_else(|| pattern_field(msg, "post", HttpPattern::Post))
+        .or_else(|| pattern_field(msg, "delete", HttpPattern::Delete))
+        .or_else(|| pattern_field(msg, "patch", HttpPattern::Patch))
+        .or_else(|| custom_pattern_field(msg));
+
+    if msg.has_field_by_name("additional_bindings") {
+        if let Some(value) = msg.get_field_by_name("additional_bindings") {
+            if let Some(items) = value.as_list() {
+                for item in items {
+                    if let Some(nested) = item.as_message() {
+                        rule.additional_bindings
+                            .push(http_rule_from_message(nested));
+                    }
+                }
+            }
         }
     }
 
-    Ok((kind, path))
+    rule
 }
 
-/// Skip a field whose number we do not handle, by wire type.
-fn skip_field(is: &mut CodedInputStream, wire_type: u32) -> protobuf::Result<()> {
-    match wire_type {
-        0 => {
-            is.read_raw_varint64()?;
-        }
-        1 => {
-            is.read_fixed64()?;
-        }
-        2 => {
-            is.read_bytes()?;
-        }
-        5 => {
-            is.read_fixed32()?;
-        }
-        other => {
-            return Err(protobuf::Error::from(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unsupported wire type {other} while skipping field"),
-            )));
-        }
+/// Read a `string` field by name, defaulting to empty.
+fn string_field(msg: &DynamicMessage, name: &str) -> String {
+    msg.get_field_by_name(name)
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// If the named `string` pattern field is set, build the pattern via `ctor`.
+fn pattern_field(
+    msg: &DynamicMessage,
+    name: &str,
+    ctor: fn(String) -> HttpPattern,
+) -> Option<HttpPattern> {
+    if !msg.has_field_by_name(name) {
+        return None;
     }
-    Ok(())
+    let path = msg.get_field_by_name(name)?.as_str()?.to_owned();
+    Some(ctor(path))
+}
+
+/// Read the `custom` `CustomHttpPattern { kind, path }` pattern, if set.
+fn custom_pattern_field(msg: &DynamicMessage) -> Option<HttpPattern> {
+    if !msg.has_field_by_name("custom") {
+        return None;
+    }
+    let custom = msg.get_field_by_name("custom")?;
+    let custom = custom.as_message()?;
+    Some(HttpPattern::Custom(
+        string_field(custom, "kind"),
+        string_field(custom, "path"),
+    ))
 }

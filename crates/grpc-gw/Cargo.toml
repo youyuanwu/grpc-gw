@@ -12,4 +12,6 @@ name = "grpc_gw"
 path = "src/lib.rs"
 
 [dependencies]
-protobuf.workspace = true
+prost.workspace = true
+prost-reflect.workspace = true
+prost-types.workspace = true

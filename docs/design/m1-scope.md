@@ -23,7 +23,7 @@ proto gets byte-compatible responses from grpc-gw for unary, unannotated and
 | ---- | ------ | ---------------- |
 | Descriptor load | `.pb` file **and** gRPC server reflection → `DescriptorRegistry` | [Descriptor loading](./grpc-gateway-design.md#descriptor-loading) |
 | Route table | Primary bindings with `body:"*"` + the synthesized default unbound-method binding (`POST /pkg.Svc/Method`) | [Default binding policy](./grpc-gateway-design.md#default-binding-policy-unannotated-methods) |
-| Request transcode | Whole JSON body → input dynamic message (`merge_from_str`) | [Request transcoding](./grpc-gateway-design.md#request-transcoding) |
+| Request transcode | Whole JSON body → input dynamic message (`DynamicMessage::deserialize`) | [Request transcoding](./grpc-gateway-design.md#request-transcoding) |
 | gRPC client | `hyper-util` h2 `Client` + 5-byte gRPC framing, metadata forward, trailer read | [gRPC client & framing](./grpc-gateway-design.md#grpc-client--framing) |
 | Response transcode | Output dynamic message → canonical proto3 JSON (`200 application/json`) | [Response transcoding](./grpc-gateway-design.md#response-transcoding) |
 | Status mapping | gRPC code → HTTP + Status-proto JSON error envelope (all 16 codes) | [Status & error mapping](./grpc-gateway-design.md#status--error-mapping) |
@@ -55,36 +55,47 @@ Deferred to keep the first cut honest — these are real features, just later:
 
 ## Spike 0 — de-risk first (blocks the route table)
 
-Before any routing work, confirm we can **decode the `google.api.http`
+Before any routing work, confirm we can **read the `google.api.http`
 extension** (`MethodOptions` extension field **72295728**) from a descriptor
-set via `protobuf::ext`. The entire route table depends on it.
+set via `prost-reflect`. The entire route table depends on it.
 
 - **Success:** read the `HttpRule` (at least `post`/`get` + `body`) off a real
   annotated `MethodDescriptor`.
-- **Fallback if `protobuf::ext` is awkward:** decode the raw `UnknownFields` of
-  `MethodOptions` for field 72295728 and parse the `HttpRule` message manually.
-- **Output:** a one-paragraph note in the PR confirming which path works, so M2
-  template work builds on a known-good extraction.
+- **Approach:** resolve the extension by name from the `DescriptorPool` and
+  read it off the method's options dynamic message — no generated annotation
+  types.
+- **Output:** a one-paragraph note in the PR confirming the extraction works,
+  so M2 template work builds on a known-good foundation.
 
 This is task zero; nothing else in M1 is unblocked until it resolves.
 
 ### Spike 0 — findings (resolved 2026-06-13)
 
-**Outcome: the `UnknownFields` path works; `protobuf::ext` is not viable for a
-dynamic gateway.** The `protobuf` crate's `ext` module (3.7.2) is a documented
-"stopgap" that requires a generated `ExtFieldOptional<MethodOptions, HttpRule>`
-constant — i.e. codegen of `google/api/annotations.proto` — which conflicts
-with the design's "no generated annotations" goal. Instead, when the crate
-parses a `FileDescriptorSet`, the `(google.api.http)` option is unknown to the
-generated `MethodOptions` struct and is preserved as a length-delimited blob in
-`MethodOptions.special_fields.unknown_fields().get(72295728)`. That blob is the
-serialized `HttpRule`, which we hand-decode (its `pattern` oneof, `body`,
-`response_body`, and `additional_bindings`) with a `CodedInputStream` — no
-`protoc`, no generated annotation types. Implemented in
+**Outcome: `prost-reflect` reads the extension cleanly as a first-class
+reflection operation — no unknown-field hacks, no generated annotations.** The
+flow is:
+
+1. `DescriptorPool::decode(&pb_bytes)` parses the `FileDescriptorSet`.
+2. `pool.get_extension_by_name("google.api.http")` resolves the
+   `ExtensionDescriptor` (present because the `.pb` was built with
+   `--include_imports`, so `google/api/annotations.proto` is in the set).
+3. For each method, `method.options()` returns a `DynamicMessage` of its
+   `MethodOptions`; `options.has_extension(&ext)` /
+   `options.get_extension(&ext)` reads the `HttpRule` message, which we lower
+   (its `pattern` oneof, `body`, `response_body`, recursive
+   `additional_bindings`) via `get_field_by_name`.
+
+Implemented in
 [`crates/grpc-gw/src/descriptor.rs`](../../crates/grpc-gw/src/descriptor.rs) and
 verified by [`tests/spike_http_rule.rs`](../../crates/grpc-gw/tests/spike_http_rule.rs)
 (GET + path template, POST + `body` + `additional_bindings`, and an unannotated
-method with no rule). M2 path-template work can build on this extraction.
+method with no rule). `prost`/`prost-reflect` are pure Rust (no C toolchain
+pulled in). M2 path-template work can build on this extraction.
+
+> Note: an earlier spike on rust-protobuf 3.7 had to hand-decode the option off
+> `MethodOptions` unknown fields because that crate's `protobuf::ext` needs
+> generated extension constants. The pivot to `prost-reflect` removed that
+> workaround entirely.
 
 
 ## Acceptance criteria

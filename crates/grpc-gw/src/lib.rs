@@ -9,4 +9,4 @@
 
 pub mod descriptor;
 
-pub use descriptor::{extract_http_rules, HttpPattern, HttpRule, MethodHttp};
+pub use descriptor::{extract_http_rules, DescriptorError, HttpPattern, HttpRule, MethodHttp};

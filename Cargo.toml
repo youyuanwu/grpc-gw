@@ -9,4 +9,6 @@ repository = "https://github.com/youyuanwu/grpc-gw"
 rust-version = "1.82"
 
 [workspace.dependencies]
-protobuf = "3.7"
+prost = "0.14"
+prost-reflect = { version = "0.16", features = ["serde"] }
+prost-types = "0.14"

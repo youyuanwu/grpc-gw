@@ -74,7 +74,7 @@ grpc-gw/
 
 | Module / target     | Role                                                            | Key deps                    |
 | ------------------- | -------------------------------------------------------------- | --------------------------- |
-| `openapi`           | Lower `DescriptorRegistry` routes + message descriptors into an OpenAPI/Swagger document | `protobuf`, `serde`, `serde_json` |
+| `openapi`           | Lower `DescriptorRegistry` routes + message descriptors into an OpenAPI/Swagger document | `prost-reflect`, `serde`, `serde_json` |
 | `bin/grpc-gw-openapi` | Thin `main`: parse args, load the `.pb` into a registry, call `openapi`, write the document | the crate's own lib         |
 
 The generator depends only on the descriptor reflection types already in use;
@@ -220,8 +220,9 @@ are emitted without `description` text.
 
 When the descriptor set carries `grpc.gateway.protoc_gen_openapiv2.options`
 annotations (the options consumed by Go's `protoc-gen-openapiv2`), the generator
-reads them via the same extension-decoding path used for `google.api.http`
-(custom options on file/method/message via `protobuf::ext` / `UnknownFields`):
+reads them via the same extension path used for `google.api.http` (resolve the
+extension by name from the `DescriptorPool` and read it off the file/method/
+message options `DynamicMessage` with `get_extension`):
 
 - `openapiv2_swagger` (file) → top-level `info`, `securityDefinitions`,
   `host`/`basePath`, global `responses`.
