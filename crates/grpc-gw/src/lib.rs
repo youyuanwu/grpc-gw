@@ -5,11 +5,17 @@
 //!
 //! At this early stage the crate exposes [`descriptor`] (the Spike 0 proof:
 //! extracting `google.api.http` annotations from a runtime-loaded
-//! `FileDescriptorSet` with no generated annotation types) and [`routes`] (the
-//! M1 route table lowered from those annotations plus synthesized defaults).
+//! `FileDescriptorSet` with no generated annotation types), [`routes`] (the
+//! M1 route table lowered from those annotations plus synthesized defaults),
+//! [`transcode`] (JSON ⇄ dynamic message), and [`status`] (gRPC code → HTTP
+//! mapping and the error envelope).
 
 pub mod descriptor;
 pub mod routes;
+pub mod status;
+pub mod transcode;
 
 pub use descriptor::{extract_http_rules, DescriptorError, HttpPattern, HttpRule, MethodHttp};
 pub use routes::{BodySelector, Route, RouteBinding, RouteConflict, RouteTable};
+pub use status::{Code, ErrorEnvelope};
+pub use transcode::{decode_request_body, encode_response_json, JsonOptions, TranscodeError};
