@@ -10,7 +10,7 @@
 
 Stand up the smallest end-to-end gateway that transcodes **unary** RPCs over
 JSON and is wire-compatible with Go grpc-gateway for that subset: load a
-descriptor set (file *or* reflection), expose every method as a JSON endpoint,
+pre-built `.pb` descriptor set, expose every method as a JSON endpoint,
 forward to the backend over h2, and render canonical proto3 JSON back.
 
 The litmus test: a client written against a Go grpc-gateway fronting the same
@@ -21,7 +21,7 @@ proto gets byte-compatible responses from grpc-gw for unary, unannotated and
 
 | Area | M1 cut | Design reference |
 | ---- | ------ | ---------------- |
-| Descriptor load | `.pb` file **and** gRPC server reflection → `DescriptorRegistry` | [Descriptor loading](./grpc-gateway-design.md#descriptor-loading) |
+| Descriptor load | Pre-built `.pb` `FileDescriptorSet` → `DescriptorRegistry` (gRPC server reflection deferred to M2) | [Descriptor loading](./grpc-gateway-design.md#descriptor-loading) |
 | Route table | Primary bindings with `body:"*"` + the synthesized default unbound-method binding (`POST /pkg.Svc/Method`) | [Default binding policy](./grpc-gateway-design.md#default-binding-policy-unannotated-methods) |
 | Request transcode | Whole JSON body → input dynamic message (`DynamicMessage::deserialize`) | [Request transcoding](./grpc-gateway-design.md#request-transcoding) |
 | gRPC client | `tonic::client::Grpc` over a `Channel` + `Bytes` passthrough codec (tonic owns framing/status), metadata forward | [gRPC client & framing](./grpc-gateway-design.md#grpc-client--framing) |
@@ -36,6 +36,9 @@ proto gets byte-compatible responses from grpc-gw for unary, unannotated and
 
 Deferred to keep the first cut honest — these are real features, just later:
 
+- **No gRPC server reflection** as a descriptor source (`--reflection`) → **M2**.
+  M1 loads a pre-built `.pb` only; the reflection-fetch path that converges on
+  the same registry lands later.
 - **No path templates** beyond the literal gRPC wire path. No single-/multi-
   segment captures, field-path captures, or custom verbs → **M2**.
 - **No `body:"field"` / `response_body` selectors**, **no query-param field-path
@@ -107,8 +110,9 @@ M1 is done when all hold:
    grpc-gateway over the same backend are byte-identical for a representative
    set of messages (scalars, nested, repeated, map, enum, int64, a WKT
    timestamp).
-2. **Both descriptor sources.** The same suite passes whether the registry was
-   loaded from a `.pb` file or via `--reflection` against the live backend.
+2. **Descriptor loading.** The suite passes against a registry loaded from a
+   pre-built `.pb` file. (Loading the same registry via `--reflection` against
+   the live backend is deferred to M2.)
 3. **Status mapping.** Each of the 16 gRPC codes returns the correct HTTP
    status and a Status-proto JSON envelope; `grpc-status-details-bin` details
    are rendered.
@@ -123,8 +127,8 @@ M1 is done when all hold:
 ## Suggested task order
 
 1. **Spike 0** — `google.api.http` extension decoding.
-2. Descriptor load: `.pb` parse → registry; then reflection client → same
-   registry. `grpc-gw check` falls out of the validation pass.
+2. Descriptor load: `.pb` parse → registry. `grpc-gw check` falls out of the
+   validation pass. (gRPC server reflection as a second source → M2.)
 3. Route table for default + `body:"*"` bindings; `grpc-gw routes`.
 4. Request transcode (whole-body) + gRPC client/framing + response transcode.
 5. Status & error mapping.

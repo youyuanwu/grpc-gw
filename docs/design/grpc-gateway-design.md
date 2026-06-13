@@ -25,9 +25,10 @@ with opposite trade-offs.
   `SCREAMING_SNAKE_CASE`, RFC 3339 timestamps, well-known-type encodings).
 - Be wire-compatible enough with grpc-gateway that clients written against a
   Go gateway keep working.
-- **Zero-config quickstart.** Point the gateway at a backend that exposes gRPC
-  server reflection and it works with no descriptor file and no flags:
-  `grpc-gw --backend http://127.0.0.1:50051 --reflection`. With a `.pb` it is
+- **Zero-config quickstart** *(M2)*. Point the gateway at a backend that exposes
+  gRPC server reflection and it works with no descriptor file and no flags:
+  `grpc-gw --backend http://127.0.0.1:50051 --reflection`. Until then (M1), and
+  whenever reflection is undesirable, run with a `.pb`:
   `grpc-gw --backend … --descriptor-set api.pb`. Embedders get the same in
   ~5 lines (see [Tier 3](#tier-3--programmatic-construction)).
 - **Be introspectable.** `grpc-gw routes` prints the resolved route table and
@@ -321,13 +322,16 @@ library.
 
 ## Descriptor loading
 
-> **Milestone:** M1 — both sources (file and reflection) land in the first cut.
+> **Milestone:** pre-built `.pb` (Source B) in **M1**; gRPC server reflection
+> (Source A) in **M2**.
 
 The gateway needs one **descriptor set** plus the gRPC backend address. It
 never shells out to `protoc` and never parses `.proto` source at runtime. The
 descriptor set comes from one of two first-class sources:
 
 ### Source A — gRPC server reflection (zero-config)
+
+> **Milestone:** M2.
 
 Point the gateway at a backend that implements
 `grpc.reflection.v1.ServerReflection` (`--reflection`) and it pulls the
@@ -346,6 +350,8 @@ the gateway parses the same compiled descriptor form and still never runs
 > pinned `.pb` (Source B).
 
 ### Source B — Pre-built `.pb` descriptor set
+
+> **Milestone:** M1.
 
 `--descriptor-set path.pb` / `descriptor_set = "…"`. Produced offline by
 `protoc --include_imports --include_source_info -o set.pb …` (or `buf build
@@ -697,8 +703,9 @@ deferred:
   method+path). It is the same validation the server runs at startup, exposed
   as a gate so a bad `.pb` fails the pipeline, not production.
 
-Both read a descriptor set from either source (file or `--reflection`) and run
-purely on the registry, so they need no listening socket.
+Both read a descriptor set (a pre-built `.pb` in M1; `--reflection` once that
+source lands in M2) and run purely on the registry, so they need no listening
+socket.
 
 ## Observability
 
@@ -861,13 +868,14 @@ transcoding.
 
 ## Milestones
 
-1. **M1 — Unary happy path.** Descriptor-set loading (file **and** reflection),
+1. **M1 — Unary happy path.** Descriptor-set loading from a pre-built `.pb`,
    route table for primary `POST body:"*"` bindings plus the default
    unbound-method binding, h2 gRPC client, canonical JSON in/out, status
    mapping, and the `routes` / `check` introspection commands. Validate against
    a Go grpc-gateway using the same proto. **Full buildable scope, non-goals,
    and acceptance criteria: [m1-scope.md](./m1-scope.md).**
-2. **M2 — Full http rule.** Path templates (multi-segment), query expansion,
+2. **M2 — Full http rule.** gRPC server reflection as a zero-config descriptor
+   source, path templates (multi-segment), query expansion,
    `body`/`response_body` selectors, `additional_bindings`, and the
    [pluggable hooks](#pluggable-hooks) (marshaler, error handler, header
    matchers, metadata).
