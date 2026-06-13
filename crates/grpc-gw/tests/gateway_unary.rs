@@ -9,7 +9,9 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use grpc_gw::{Gateway, GatewayOptions, GrpcClient};
@@ -21,7 +23,9 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use prost::Message;
 use prost_reflect::{DescriptorPool, DynamicMessage, Value};
-use tokio::net::TcpListener;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 
 const GREETER_PB: &[u8] = include_bytes!("fixtures/greeter.pb");
 
@@ -235,4 +239,113 @@ async fn serve_connection_serves_over_a_socket() {
     assert_eq!(resp.status(), 200);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body, &br#"{"pong":"pong!"}"#[..]);
+}
+
+/// Fires `cancelled` from its `Drop` — i.e. when the backend handler future it
+/// lives in is dropped because the upstream gRPC stream was reset.
+struct CancelGuard(Option<oneshot::Sender<()>>);
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Spawn a backend whose unary handler signals `started`, then hangs forever
+/// holding a [`CancelGuard`]. If the gateway resets the upstream stream (because
+/// its inbound connection was dropped), hyper drops the handler future and the
+/// guard fires `cancelled` — proving the call was not leaked.
+async fn spawn_hanging_backend(
+    started: oneshot::Sender<()>,
+    cancelled: oneshot::Sender<()>,
+) -> SocketAddr {
+    let started = Arc::new(Mutex::new(Some(started)));
+    let cancelled = Arc::new(Mutex::new(Some(cancelled)));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let started = started.clone();
+            let cancelled = cancelled.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |_req: Request<Incoming>| {
+                    let started = started.lock().unwrap().take();
+                    let guard = cancelled
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .map(|tx| CancelGuard(Some(tx)));
+                    async move {
+                        if let Some(tx) = started {
+                            let _ = tx.send(());
+                        }
+                        // Hold the guard across an await that never resolves;
+                        // dropping this future (stream reset) drops the guard.
+                        let _guard = guard;
+                        std::future::pending::<Result<Response<FrameList>, Infallible>>().await
+                    }
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn client_disconnect_cancels_upstream_call() {
+    let (started_tx, started_rx) = oneshot::channel();
+    let (cancelled_tx, cancelled_rx) = oneshot::channel();
+    let backend_addr = spawn_hanging_backend(started_tx, cancelled_tx).await;
+
+    let client = GrpcClient::plaintext(format!("http://{backend_addr}").parse().unwrap())
+        .expect("valid backend");
+    let gateway = Gateway::builder(GREETER_PB.to_vec())
+        .backend(client)
+        .build()
+        .expect("gateway builds");
+
+    // Serve the gateway over a front socket (Tier-1 byte stream).
+    let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front_addr = front.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = front.accept().await.unwrap();
+        // Returns an error once the client disconnects — expected.
+        let _ = grpc_gw::serve_connection(stream, gateway).await;
+    });
+
+    // Send a raw HTTP/1.1 request the backend will hang on (never responds).
+    let mut stream = TcpStream::connect(front_addr).await.unwrap();
+    stream
+        .write_all(
+            b"POST /greeter.v1.Greeter/Ping HTTP/1.1\r\n\
+              Host: localhost\r\n\
+              Content-Type: application/json\r\n\
+              Content-Length: 2\r\n\r\n{}",
+        )
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+
+    // The proxied call must actually reach the backend first — otherwise the
+    // cancellation assertion would be vacuous.
+    tokio::time::timeout(Duration::from_secs(5), started_rx)
+        .await
+        .expect("backend should receive the proxied call within 5s")
+        .expect("started channel not dropped");
+
+    // Drop the inbound connection mid-call.
+    drop(stream);
+
+    // The gateway must reset the upstream gRPC stream, dropping the backend
+    // handler future (no leaked call).
+    tokio::time::timeout(Duration::from_secs(5), cancelled_rx)
+        .await
+        .expect("backend handler must be cancelled when the client disconnects")
+        .expect("cancel channel not dropped");
 }
