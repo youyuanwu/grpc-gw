@@ -24,7 +24,7 @@ proto gets byte-compatible responses from grpc-gw for unary, unannotated and
 | Descriptor load | `.pb` file **and** gRPC server reflection → `DescriptorRegistry` | [Descriptor loading](./grpc-gateway-design.md#descriptor-loading) |
 | Route table | Primary bindings with `body:"*"` + the synthesized default unbound-method binding (`POST /pkg.Svc/Method`) | [Default binding policy](./grpc-gateway-design.md#default-binding-policy-unannotated-methods) |
 | Request transcode | Whole JSON body → input dynamic message (`DynamicMessage::deserialize`) | [Request transcoding](./grpc-gateway-design.md#request-transcoding) |
-| gRPC client | `hyper-util` h2 `Client` + 5-byte gRPC framing, metadata forward, trailer read | [gRPC client & framing](./grpc-gateway-design.md#grpc-client--framing) |
+| gRPC client | `tonic::client::Grpc` over a `Channel` + `Bytes` passthrough codec (tonic owns framing/status), metadata forward | [gRPC client & framing](./grpc-gateway-design.md#grpc-client--framing) |
 | Response transcode | Output dynamic message → canonical proto3 JSON (`200 application/json`) | [Response transcoding](./grpc-gateway-design.md#response-transcoding) |
 | Status mapping | gRPC code → HTTP + Status-proto JSON error envelope (all 16 codes) | [Status & error mapping](./grpc-gateway-design.md#status--error-mapping) |
 | Header forwarding | Static default allow-list only (no custom matchers yet) | [Header / metadata forwarding](./grpc-gateway-design.md#header--metadata-forwarding) |

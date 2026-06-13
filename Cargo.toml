@@ -17,7 +17,7 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 bytes = "1"
 http = "1"
-http-body-util = "0.1"
-hyper = "1"
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http2", "tokio"] }
 tokio = { version = "1", features = ["rt", "net", "io-util"] }
+# Client transport only: `channel` pulls the hyper-util client + tower balance,
+# not the server/router (which `transport` would add).
+tonic = { version = "0.14", default-features = false, features = ["channel"] }

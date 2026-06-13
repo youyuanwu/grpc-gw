@@ -143,7 +143,7 @@ grpc-gw/
 | --------------- | ----------------------------------------------------------------------- | ----------------------------------------- |
 | `descriptor`    | Descriptor registry, route table, path-template matcher, http-rule model | `prost-reflect`, `prost-types`            |
 | `transcode`     | Request/response transcoding (JSON ⇄ dynamic message, query/path binding) | `prost-reflect` (`serde`), `prost`, `serde_json` |
-| `proxy`         | `GrpcClient`: gRPC framing/status mapping over a `hyper_util` h2 `Client` (pluggable connector) | `hyper`, `hyper-util`, `http`, `tokio`, `bytes` |
+| `proxy`         | `GrpcClient`: passthrough-codec `tonic::client::Grpc` over a `tonic::transport::Channel` (framing/status owned by tonic) | `tonic` (`channel`), `http`, `tokio`, `bytes` |
 | `server`        | Byte-stream `serve_connection` (HTTP decode) + tower middleware binding the `Gateway` service (no socket/TLS/config) | `hyper`, `hyper-util`, `tower`, `tower-http`, `tokio`   |
 | `openapi`       | Descriptor registry → OpenAPI/Swagger document (see [openapi-generation.md](./openapi-generation.md)) | `prost-reflect`, `serde`, `serde_json` |
 | `bin/grpc-gw`   | Thin `main` that wires the above into a runnable gateway binary          | the crate's own lib                       |
@@ -191,16 +191,15 @@ it never opens a socket itself.
 ```rust
 // Inbound: hand the gateway one accepted connection's byte stream. The library
 // decodes the REST/HTTP wire format off it; you own how the bytes arrive.
-pub async fn serve_connection<IO>(io: IO, gateway: Gateway<impl Connect>)
+pub async fn serve_connection<IO>(io: IO, gateway: Gateway)
     -> Result<(), ServeError>
 where IO: AsyncRead + AsyncWrite + Unpin + Send + 'static;
 
-// Outbound: the backend byte stream is produced by a hyper-util connector
-// (`C: Connect`, a `tower::Service<Uri>` yielding the stream). TCP, TLS, Unix,
+// Outbound: the backend byte stream is produced by a tonic `Endpoint`
+// connector (a `tower::Service<Uri>` yielding the stream). TCP, TLS, Unix,
 // in-memory duplex, and custom streams are all just connectors.
-let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
-    .http2_only(true)
-    .build(connector);              // connector owns how the byte stream is dialed
+let channel = Endpoint::from_shared(backend_uri)?
+    .connect_with_connector_lazy(connector);   // connector owns how the stream is dialed
 ```
 
 **TLS is a stream adapter, not a gateway feature.** Because both seams are just
@@ -214,10 +213,9 @@ let tls = acceptor.accept(tcp).await?;          // TlsStream: AsyncRead + AsyncW
 serve_connection(tls, gateway.clone()).await?;
 
 // Outbound TLS to the backend: use a TLS-capable connector (e.g. an
-// `HttpsConnector`); the hyper-util Client handshakes h2 over it for you.
-let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
-    .http2_only(true)
-    .build(https_connector);
+// `HttpsConnector`); tonic's `Channel` handshakes h2 over it for you.
+let channel = Endpoint::from_shared(backend_uri)?
+    .connect_with_connector_lazy(https_connector);
 ```
 
 The same seam accepts **custom streams**: implement `AsyncRead + AsyncWrite`
@@ -243,55 +241,62 @@ impl tower::Service<http::Request<ReqBody>> for Gateway {
 ```
 
 On the backend side there is **no bespoke transport trait** — the gateway
-holds a `hyper_util::client::legacy::Client` in HTTP/2 mode and speaks gRPC
-over it. hyper-util already provides the h2 handshake, per-authority connection
-pooling, and stream multiplexing; a thin `grpc` helper adds the gRPC framing
-(5-byte length prefix), the `te: trailers` / `content-type` headers, and reads
-the trailing `grpc-status` off the response body's trailer frame. The only
-gateway-owned piece is that small framing wrapper:
+holds a `tonic::transport::Channel` and drives `tonic::client::Grpc` over it.
+tonic already provides the h2 handshake, per-authority connection pooling,
+stream multiplexing, **and** the gRPC framing (5-byte length prefix), the
+`te: trailers` / `content-type` headers, and trailer `grpc-status` parsing. The
+only gateway-owned piece is a trivial passthrough `Codec` that hands messages
+through as raw bytes:
 
 ```rust
-// Built-in client = hyper-util Client (http2_only) + gRPC framing. No new trait.
-pub struct GrpcClient<C> {
-    inner: hyper_util::client::legacy::Client<C, BoxBody<Bytes, Status>>,
-    authority: http::uri::Authority,
+// Built-in client = tonic Grpc<Channel> + a Bytes passthrough Codec. No new trait.
+pub struct GrpcClient {
+    channel: tonic::transport::Channel,
 }
 
-impl<C: Connect + Clone + Send + Sync + 'static> GrpcClient<C> {
-    /// Open a (server-streaming-capable) gRPC call: send length-prefixed
-    /// request frames, stream back response frames, resolve the trailer status.
-    pub async fn call(
+impl GrpcClient {
+    /// h2c convenience constructor (plaintext over TCP).
+    pub fn plaintext(backend: http::Uri) -> Result<Self, ProxyError>;
+    /// Pluggable-transport seam: hand in any tonic `Channel` (TLS/Unix/duplex/LB).
+    pub fn with_channel(channel: tonic::transport::Channel) -> Self;
+
+    /// Perform a unary call: send the request bytes with forwarded metadata,
+    /// returning the response message or the gRPC status.
+    pub async fn unary(
         &self,
         path: &str,                          // "/pkg.Svc/Method"
+        message: bytes::Bytes,               // encoded request message
         metadata: http::HeaderMap,           // forwarded request metadata
-        body: BoxBody<Bytes, Status>,        // request frame stream
-    ) -> Result<http::Response<hyper::body::Incoming>, Status>;
+    ) -> Result<GrpcReply, ProxyError>;
 }
 ```
 
-**Pluggability lives in the connector, not a trait.** hyper-util's `Client<C, B>`
-is generic over a connector `C: Connect` — itself a `tower::Service<Uri>` that
-yields a byte stream. That is the *same* Tier-1 seam: a TCP connector, a TLS
-`HttpsConnector`, a Unix-socket connector, or an in-memory `duplex` connector
-all slot in here, including for the [co-hosting](./co-hosting-with-tonic.md)
-in-process backend. So "custom backend transport" = "supply a connector", and
-we reuse hyper-util's pooling/h2 instead of reimplementing it behind a trait.
+**Pluggability lives in the channel's connector, not a trait.** A tonic
+`Channel` is built from an `Endpoint` plus a connector — itself a
+`tower::Service<Uri>` that yields a byte stream. That is the *same* Tier-1
+seam: a TCP connector, a TLS `HttpsConnector`, a Unix-socket connector, or an
+in-memory `duplex` connector all slot in via
+`Endpoint::connect_with_connector`, including for the
+[co-hosting](./co-hosting-with-tonic.md) in-process backend. So "custom backend
+transport" = "build a `Channel` and pass it to `with_channel`", and we reuse
+tonic's pooling/h2/framing instead of reimplementing it.
 
 ### Tier 3 — Programmatic construction
 
 The `Gateway` is built from an already-parsed `DescriptorRegistry`, a
-`GrpcClient` (hyper-util `Client` + gRPC framing), and a plain `GatewayOptions`
-value (the routing/transcoding knobs) — never from a file path or a config
-object. The client's connector is where TLS / custom streams compose:
+`GrpcClient` (tonic `Channel` + a `Bytes` passthrough codec), and a plain
+`GatewayOptions` value (the routing/transcoding knobs) — never from a file path
+or a config object. The channel's connector is where TLS / custom streams
+compose:
 
 ```rust
 let registry = DescriptorRegistry::from_descriptor_set(&pb_bytes)?;   // bytes in, not a path
 
-// hyper-util Client in h2 mode; swap the connector for TLS/Unix/duplex/custom.
-let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
-    .http2_only(true)
-    .build(connector);                                                // any C: Connect
-let backend = GrpcClient::new(client, backend_authority);
+// tonic Channel; swap the connector for TLS/Unix/duplex/custom, or use
+// GrpcClient::plaintext(uri) for the h2c common case.
+let channel = Endpoint::from_shared(backend_uri)?
+    .connect_with_connector_lazy(connector);                          // any tower::Service<Uri>
+let backend = GrpcClient::with_channel(channel);
 
 let gateway = Gateway::builder(registry)
     .backend(backend)
@@ -500,29 +505,36 @@ Type/precision coercion (e.g. string→`int64`, name→enum) is centralized in a
 ## gRPC client & framing
 
 The proxy speaks raw gRPC over HTTP/2 — no typed stubs. It does **not**
-hand-roll an h2 client: it uses a `hyper_util::client::legacy::Client` in
-`http2_only` mode (which owns the handshake, per-authority pooling, and stream
-multiplexing) and adds only the gRPC framing on top.
+hand-roll the gRPC wire layer: it drives **tonic**'s
+`tonic::client::Grpc<Channel>` over a `tonic::transport::Channel`, which owns
+the handshake, per-authority pooling, h2 stream multiplexing, **and** the gRPC
+framing, `content-type`/`te` headers, trailer/status parsing, and
+`grpc-status-details-bin` decoding. We add only a trivial passthrough `Codec`
+whose `Encode`/`Decode` types are raw `Bytes`, so messages cross the boundary
+as opaque bytes — the transcoder owns JSON ⇄ protobuf, tonic owns the wire.
 
 1. Serialize the input dynamic message: `msg.encode_to_vec()` (the
-   `prost::Message` impl on `DynamicMessage`).
-2. Frame it: 1 compression byte (`0`) + 4-byte big-endian length + payload.
-3. Send a `POST {grpc_path}` request through the hyper-util `Client` (which
-   borrows/opens a pooled h2 connection via its connector) with:
-   - `content-type: application/grpc+proto`
-   - `te: trailers`
-   - forwarded metadata headers (see below).
-4. Stream request frame(s) as the request body.
-5. Read response data frames off the response body, de-frame, and decode into
+   `prost::Message` impl on `DynamicMessage`) into `Bytes`.
+2. Build a `tonic::Request<Bytes>`, attach the forwarded metadata
+   (`MetadataMap::from_headers`), and `Grpc::unary(req, path, BytesCodec)` —
+   tonic frames the message, sets `content-type: application/grpc`,
+   `te: trailers`, and reads the single response frame.
+3. On success, `unary` yields the response message `Bytes`, which decode into
    the **output dynamic message**: `DynamicMessage::decode(route.output.clone(),
    payload)`.
-6. Read the trailing `grpc-status` / `grpc-message` (and `grpc-status-details-bin`
-   for `google.rpc.Status` details) from the response's trailer frame. Map to
-   HTTP.
+4. On a non-OK result, tonic surfaces a `Status` (code, `grpc-message`, and
+   already-decoded `grpc-status-details-bin`), which maps to HTTP.
 
-Connection pooling is hyper-util's, keyed per-backend-authority. The client
-never needs to know message types — it shuttles bytes and lets the transcoder
-interpret them.
+Connection management — lazy connect, reconnect/backoff, and (multi-endpoint)
+load balancing — is tonic's `Channel`. The client never needs to know message
+types; it shuttles bytes and lets the transcoder interpret them.
+
+> **Transport pluggability.** `GrpcClient` carries **no** generic connector
+> parameter: a `Channel` erases its connector. TLS, Unix sockets, in-memory
+> duplex, and load-balanced backends are all built by the caller via tonic's
+> `Endpoint` (e.g. `connect_with_connector`) and handed to
+> `GrpcClient::with_channel`. `GrpcClient::plaintext(uri)` is the h2c
+> convenience constructor.
 
 ### Header / metadata forwarding
 
@@ -649,7 +661,7 @@ file, and never owns the socket or TLS:
 // `registry`, `backend`, and `opts` are produced by the caller — the binary
 // parses TOML/flags into them; an embedder constructs them directly.
 let gateway = grpc_gw::Gateway::builder(registry)
-    .backend(backend)            // GrpcClient = hyper-util h2 Client + gRPC framing (any connector)
+    .backend(backend)            // GrpcClient = tonic Channel + Bytes passthrough codec (any connector)
     .options(opts)               // GatewayOptions: routing/transcoding knobs
     .build();                    // tower::Service<http::Request<_>> → http::Response<_>
 
@@ -705,7 +717,7 @@ middleware for embedders:
   gRPC status.
 - **Metrics** (Prometheus, at `/metrics`): per-route request counts, latency
   histograms, in-flight gauge, and gRPC-status-code counters, plus upstream
-  connection-pool stats from hyper-util.
+  connection-pool stats from tonic's `Channel`.
 
 These are pluggable: an embedder using the Tier-2 `tower::Service` simply omits
 the middleware or substitutes their own layers.
