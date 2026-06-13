@@ -1,0 +1,52 @@
+// Test fixture service for grpc-gw. Exercises:
+//   - a method with a google.api.http annotation (GET + path template)
+//   - a method with an annotation using POST + body + additional_bindings
+//   - a method with NO annotation (default-binding path)
+syntax = "proto3";
+
+package greeter.v1;
+
+import "google/api/annotations.proto";
+
+service Greeter {
+  // Annotated: GET with a path-template capture.
+  rpc SayHello(HelloRequest) returns (HelloReply) {
+    option (google.api.http) = {
+      get: "/v1/greeter/{name}"
+    };
+  }
+
+  // Annotated: POST with a body selector and an additional binding.
+  rpc UpdateGreeting(UpdateGreetingRequest) returns (HelloReply) {
+    option (google.api.http) = {
+      post: "/v1/greeter/{name}/greeting"
+      body: "greeting"
+      additional_bindings {
+        patch: "/v1/greeter/{name}/greeting"
+        body: "greeting"
+      }
+    };
+  }
+
+  // Unannotated: reachable only via the synthesized default binding.
+  rpc Ping(PingRequest) returns (PingReply) {}
+}
+
+message HelloRequest {
+  string name = 1;
+}
+
+message HelloReply {
+  string message = 1;
+}
+
+message UpdateGreetingRequest {
+  string name = 1;
+  string greeting = 2;
+}
+
+message PingRequest {}
+
+message PingReply {
+  string pong = 1;
+}

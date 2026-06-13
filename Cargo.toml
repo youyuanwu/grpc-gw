@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/grpc-gw"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/youyuanwu/grpc-gw"
+rust-version = "1.82"
+
+[workspace.dependencies]
+protobuf = "3.7"

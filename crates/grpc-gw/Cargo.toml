@@ -1,0 +1,15 @@
+[package]
+name = "grpc-gw"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Dynamic gRPC↔JSON transcoding reverse proxy in the spirit of grpc-gateway"
+
+[lib]
+name = "grpc_gw"
+path = "src/lib.rs"
+
+[dependencies]
+protobuf.workspace = true
