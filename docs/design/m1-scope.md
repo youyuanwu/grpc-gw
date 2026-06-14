@@ -13,9 +13,11 @@ JSON and is wire-compatible with Go grpc-gateway for that subset: load a
 pre-built `.pb` descriptor set, expose every method as a JSON endpoint,
 forward to the backend over h2, and render canonical proto3 JSON back.
 
-The litmus test: a client written against a Go grpc-gateway fronting the same
-proto gets byte-compatible responses from grpc-gw for unary, unannotated and
-`body:"*"`-annotated methods.
+The litmus test: grpc-gw renders **canonical proto3 JSON** for unary,
+unannotated and `body:"*"`-annotated methods, so a client written against a Go
+grpc-gateway fronting the same proto keeps working. (Mechanically diffing
+grpc-gw against a live Go gateway is the conformance harness, deferred to M2 —
+see [NOT in M1](#explicitly-not-in-m1).)
 
 ## In scope
 
@@ -39,6 +41,10 @@ Deferred to keep the first cut honest — these are real features, just later:
 - **No gRPC server reflection** as a descriptor source (`--reflection`) → **M2**.
   M1 loads a pre-built `.pb` only; the reflection-fetch path that converges on
   the same registry lands later.
+- **No cross-conformance harness** against a live Go grpc-gateway → **M2**. M1
+  asserts canonical proto3 JSON against grpc-gw's own expected outputs;
+  mechanically diffing byte-for-byte against a Go gateway (or its golden files)
+  comes later.
 - **No path templates** beyond the literal gRPC wire path. No single-/multi-
   segment captures, field-path captures, or custom verbs → **M2**.
 - **No `body:"field"` / `response_body` selectors**, **no query-param field-path
@@ -105,11 +111,12 @@ pulled in). M2 path-template work can build on this extraction.
 
 M1 is done when all hold:
 
-1. **Conformance vs. Go.** For a fixture proto with (a) an unannotated method
-   and (b) a `body:"*"`-annotated method, responses from grpc-gw and a Go
-   grpc-gateway over the same backend are byte-identical for a representative
-   set of messages (scalars, nested, repeated, map, enum, int64, a WKT
-   timestamp).
+1. **Canonical JSON round-trip.** For a fixture proto with (a) an unannotated
+   method and (b) a `body:"*"`-annotated method, grpc-gw renders canonical
+   proto3 JSON in/out for a representative set of messages (scalars, nested,
+   repeated, map, enum, int64, a WKT timestamp), asserted against
+   grpc-gw's own expected JSON. (Byte-for-byte *cross-conformance* against a
+   live Go grpc-gateway is the harness deferred to M2.)
 2. **Descriptor loading.** The suite passes against a registry loaded from a
    pre-built `.pb` file. (Loading the same registry via `--reflection` against
    the live backend is deferred to M2.)
@@ -133,7 +140,8 @@ M1 is done when all hold:
 4. Request transcode (whole-body) + gRPC client/framing + response transcode.
 5. Status & error mapping.
 6. Tier-3 builder + Tier-1 `serve_connection` + thin `bin/grpc-gw`.
-7. Conformance harness against Go grpc-gateway; close the acceptance list.
+7. Canonical-JSON round-trip tests over the fixture proto; close the acceptance
+   list. (Cross-conformance harness against Go grpc-gateway → M2.)
 
 ## References
 

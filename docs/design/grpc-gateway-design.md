@@ -871,11 +871,12 @@ transcoding.
 1. **M1 — Unary happy path.** Descriptor-set loading from a pre-built `.pb`,
    route table for primary `POST body:"*"` bindings plus the default
    unbound-method binding, h2 gRPC client, canonical JSON in/out, status
-   mapping, and the `routes` / `check` introspection commands. Validate against
-   a Go grpc-gateway using the same proto. **Full buildable scope, non-goals,
-   and acceptance criteria: [m1-scope.md](./m1-scope.md).**
+   mapping, and the `routes` / `check` introspection commands, validated by
+   canonical-JSON round-trip tests over a fixture proto. **Full buildable
+   scope, non-goals, and acceptance criteria: [m1-scope.md](./m1-scope.md).**
 2. **M2 — Full http rule.** gRPC server reflection as a zero-config descriptor
-   source, path templates (multi-segment), query expansion,
+   source, a cross-conformance harness diffing grpc-gw against a live Go
+   grpc-gateway, path templates (multi-segment), query expansion,
    `body`/`response_body` selectors, `additional_bindings`, and the
    [pluggable hooks](#pluggable-hooks) (marshaler, error handler, header
    matchers, metadata).
