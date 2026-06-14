@@ -12,18 +12,22 @@ publish = false
 name = "grpc_gw_tests"
 path = "src/lib.rs"
 
-# The crate's only job is to compile the proto fixtures into a FileDescriptorSet
-# at build time (via `build.rs` + `protoc`) and host the integration tests that
-# consume it — so the generated `.pb` is never checked into git, and the main
-# `grpc-gw` library carries no `protoc` build dependency.
-[dev-dependencies]
-grpc-gw = { path = "../grpc-gw" }
-tokio = { version = "1", features = ["full"] }
+# The crate's job is twofold: compile the proto fixtures into a
+# FileDescriptorSet at build time (via `build.rs` + `protoc`) and host the
+# shared backend harness + integration tests that consume it — so the generated
+# `.pb` is never checked into git, and the main `grpc-gw` library carries no
+# `protoc` build dependency. Because the lib (`src/backend.rs`) is the shared
+# test harness, the hyper/tokio stack lives in `[dependencies]`, not dev-deps.
+[dependencies]
+bytes.workspace = true
+http.workspace = true
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "tokio"] }
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+grpc-gw = { path = "../grpc-gw" }
 http-body-util = "0.1"
 prost.workspace = true
 prost-reflect.workspace = true
-bytes.workspace = true
-http.workspace = true
 serde_json.workspace = true

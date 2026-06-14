@@ -7,53 +7,23 @@
 //! transcode → gRPC framing/call (tonic) → response transcode.
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use grpc_gw::{Gateway, GatewayOptions, GrpcClient};
 use http::HeaderMap;
 use http_body_util::BodyExt;
-use hyper::body::{Body, Frame, Incoming};
-use hyper::service::service_fn;
+use hyper::body::Incoming;
 use hyper::{Request, Response};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use prost::Message;
 use prost_reflect::{DescriptorPool, DynamicMessage, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
-use grpc_gw_tests::GREETER_PB;
-
-/// Prefix `payload` with the 5-byte gRPC frame header (uncompressed).
-fn frame(payload: &[u8]) -> Bytes {
-    let mut buf = BytesMut::with_capacity(5 + payload.len());
-    buf.put_u8(0);
-    buf.put_u32(payload.len() as u32);
-    buf.put_slice(payload);
-    buf.freeze()
-}
-
-/// A finite response body yielding a fixed list of frames in order.
-struct FrameList {
-    frames: std::collections::VecDeque<Frame<Bytes>>,
-}
-
-impl Body for FrameList {
-    type Data = Bytes;
-    type Error = Infallible;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        Poll::Ready(self.frames.pop_front().map(Ok))
-    }
-}
+use grpc_gw_tests::{deframe, Backend, FrameList, GREETER_PB};
 
 /// Encode a `greeter.v1.PingReply { pong }` to protobuf bytes via reflection.
 fn ping_reply(pong: &str) -> Bytes {
@@ -62,13 +32,6 @@ fn ping_reply(pong: &str) -> Bytes {
     let mut msg = DynamicMessage::new(desc);
     msg.set_field_by_name("pong", Value::String(pong.to_owned()));
     Bytes::from(msg.encode_to_vec())
-}
-
-/// Strip the 5-byte gRPC frame header, returning the message payload.
-fn deframe(buf: &[u8]) -> Bytes {
-    assert!(buf.len() >= 5, "frame header present");
-    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-    Bytes::copy_from_slice(&buf[5..5 + len])
 }
 
 /// Backend dispatcher: `/Echo` echoes the framed request message back with an
@@ -83,14 +46,9 @@ async fn handle(req: Request<Incoming>) -> Result<Response<FrameList>, Infallibl
         ping_reply("pong!")
     };
 
-    let mut trailers = HeaderMap::new();
-    trailers.insert("grpc-status", "0".parse().unwrap());
-    let body = FrameList {
-        frames: vec![Frame::data(frame(&reply)), Frame::trailers(trailers)].into(),
-    };
     Ok(Response::builder()
         .header("content-type", "application/grpc+proto")
-        .body(body)
+        .body(FrameList::unary_ok(&reply))
         .unwrap())
 }
 
@@ -100,53 +58,32 @@ async fn handle_status(_req: Request<Incoming>) -> Result<Response<FrameList>, I
         .header("content-type", "application/grpc+proto")
         .header("grpc-status", "7") // PERMISSION_DENIED
         .header("grpc-message", "nope")
-        .body(FrameList {
-            frames: Default::default(),
-        })
+        .body(FrameList::empty())
         .unwrap())
 }
 
-async fn spawn_backend() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service_fn(handle))
-                    .await;
-            });
-        }
-    });
-    addr
+async fn spawn_backend() -> Backend {
+    Backend::spawn(handle).await
 }
 
 /// Spawn a backend that always returns `PERMISSION_DENIED`.
-async fn spawn_status_backend() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service_fn(handle_status))
-                    .await;
-            });
-        }
-    });
-    addr
+async fn spawn_status_backend() -> Backend {
+    Backend::spawn(handle_status).await
 }
 
-/// Build a gateway wired to a live fake backend.
-async fn gateway_to_backend() -> Gateway {
-    let addr = spawn_backend().await;
-    let backend = format!("http://{addr}").parse().unwrap();
-    let client = GrpcClient::plaintext(backend).expect("valid backend");
-    Gateway::builder(GREETER_PB.to_vec())
+/// Build a gateway wired to a live fake backend. The returned [`Backend`] guard
+/// must be kept alive for the duration of the test — dropping it tears the
+/// backend down.
+async fn gateway_to_backend() -> (Gateway, Backend) {
+    let backend = spawn_backend().await;
+    let uri = format!("http://{}", backend.addr()).parse().unwrap();
+    let client = GrpcClient::plaintext(uri).expect("valid backend");
+    let gateway = Gateway::builder(GREETER_PB.to_vec())
         .backend(client)
         .options(GatewayOptions::default())
         .build()
-        .expect("gateway builds")
+        .expect("gateway builds");
+    (gateway, backend)
 }
 
 /// Build a gateway with a backend that is never actually reached (for the
@@ -161,7 +98,7 @@ fn gateway_offline() -> Gateway {
 
 #[tokio::test]
 async fn unary_default_binding_round_trip() {
-    let gateway = gateway_to_backend().await;
+    let (gateway, _backend) = gateway_to_backend().await;
 
     // Ping is unannotated → reachable via the synthesized default binding.
     let resp = gateway
@@ -184,7 +121,7 @@ async fn unary_default_binding_round_trip() {
 
 #[tokio::test]
 async fn empty_body_is_accepted_for_default_binding() {
-    let gateway = gateway_to_backend().await;
+    let (gateway, _backend) = gateway_to_backend().await;
     let resp = gateway
         .handle(
             "POST",
@@ -201,7 +138,7 @@ async fn kitchen_echo_round_trip_through_gateway() {
     // End-to-end proto3-JSON type coverage: a populated Kitchen message goes
     // JSON → request transcode → gRPC (echoed by the backend) → response
     // transcode → canonical JSON, with all the tricky kinds intact.
-    let gateway = gateway_to_backend().await;
+    let (gateway, _backend) = gateway_to_backend().await;
 
     let input = br#"{
         "i32": 7,
@@ -246,8 +183,9 @@ async fn kitchen_echo_round_trip_through_gateway() {
 async fn non_ok_grpc_status_maps_to_http_error() {
     // A backend PERMISSION_DENIED (7) must render as HTTP 403 with the
     // Status-proto JSON envelope.
-    let addr = spawn_status_backend().await;
-    let client = GrpcClient::plaintext(format!("http://{addr}").parse().unwrap()).unwrap();
+    let server = spawn_status_backend().await;
+    let client =
+        GrpcClient::plaintext(format!("http://{}", server.addr()).parse().unwrap()).unwrap();
     let gateway = Gateway::builder(GREETER_PB.to_vec())
         .backend(client)
         .build()
@@ -323,7 +261,7 @@ async fn invalid_json_returns_400() {
 #[tokio::test]
 async fn serve_connection_serves_over_a_socket() {
     // Tier-1 embedding: accept a TCP connection and serve the gateway over it.
-    let gateway = gateway_to_backend().await;
+    let (gateway, _backend) = gateway_to_backend().await;
     let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let front_addr = front.local_addr().unwrap();
 
@@ -373,50 +311,37 @@ impl Drop for CancelGuard {
 async fn spawn_hanging_backend(
     started: oneshot::Sender<()>,
     cancelled: oneshot::Sender<()>,
-) -> SocketAddr {
+) -> Backend {
     let started = Arc::new(Mutex::new(Some(started)));
     let cancelled = Arc::new(Mutex::new(Some(cancelled)));
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let started = started.clone();
-            let cancelled = cancelled.clone();
-            tokio::spawn(async move {
-                let service = service_fn(move |_req: Request<Incoming>| {
-                    let started = started.lock().unwrap().take();
-                    let guard = cancelled
-                        .lock()
-                        .unwrap()
-                        .take()
-                        .map(|tx| CancelGuard(Some(tx)));
-                    async move {
-                        if let Some(tx) = started {
-                            let _ = tx.send(());
-                        }
-                        // Hold the guard across an await that never resolves;
-                        // dropping this future (stream reset) drops the guard.
-                        let _guard = guard;
-                        std::future::pending::<Result<Response<FrameList>, Infallible>>().await
-                    }
-                });
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await;
-            });
+    Backend::spawn(move |_req: Request<Incoming>| {
+        let started = started.lock().unwrap().take();
+        let guard = cancelled
+            .lock()
+            .unwrap()
+            .take()
+            .map(|tx| CancelGuard(Some(tx)));
+        async move {
+            if let Some(tx) = started {
+                let _ = tx.send(());
+            }
+            // Hold the guard across an await that never resolves; dropping this
+            // future (stream reset) drops the guard.
+            let _guard = guard;
+            std::future::pending::<Result<Response<FrameList>, Infallible>>().await
         }
-    });
-    addr
+    })
+    .await
 }
 
 #[tokio::test]
 async fn client_disconnect_cancels_upstream_call() {
     let (started_tx, started_rx) = oneshot::channel();
     let (cancelled_tx, cancelled_rx) = oneshot::channel();
-    let backend_addr = spawn_hanging_backend(started_tx, cancelled_tx).await;
+    let server = spawn_hanging_backend(started_tx, cancelled_tx).await;
 
-    let client = GrpcClient::plaintext(format!("http://{backend_addr}").parse().unwrap())
+    let client = GrpcClient::plaintext(format!("http://{}", server.addr()).parse().unwrap())
         .expect("valid backend");
     let gateway = Gateway::builder(GREETER_PB.to_vec())
         .backend(client)
