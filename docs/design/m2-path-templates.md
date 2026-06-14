@@ -1,5 +1,14 @@
 # grpc-gw — M2.1 path templates (routing & binding)
 
+> **Status: implemented (2026-06-13).** Parser/matcher in
+> [`template.rs`](../../crates/grpc-gw/src/template.rs), field-path binding in
+> [`transcode.rs`](../../crates/grpc-gw/src/transcode.rs), structural
+> conflict/shadowing in [`routes.rs`](../../crates/grpc-gw/src/routes.rs),
+> matcher + body/query/response_body wiring in
+> [`gateway.rs`](../../crates/grpc-gw/src/gateway.rs), and the `--strict-routes`
+> flag in the `serve`/`check` CLI. All six acceptance criteria below are
+> covered by tests.
+>
 > Implementer-facing companion to the [architecture design](./grpc-gateway-design.md),
 > the first buildable slice of **M2**. The design doc is authoritative on
 > *architecture*; this doc is authoritative on the *path-template boundary* —

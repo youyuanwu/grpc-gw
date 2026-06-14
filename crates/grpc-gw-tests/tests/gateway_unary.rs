@@ -34,14 +34,72 @@ fn ping_reply(pong: &str) -> Bytes {
     Bytes::from(msg.encode_to_vec())
 }
 
-/// Backend dispatcher: `/Echo` echoes the framed request message back with an
-/// OK trailer; everything else returns a `PingReply { pong: "pong!" }`.
-async fn handle(req: Request<Incoming>) -> Result<Response<FrameList>, Infallible> {
-    let is_echo = req.uri().path().ends_with("/Echo");
-    let request_body = req.into_body().collect().await.unwrap().to_bytes();
+/// Decode a protobuf message of the given fully-qualified type from bytes.
+fn decode_msg(type_name: &str, bytes: &[u8]) -> DynamicMessage {
+    let pool = DescriptorPool::decode(GREETER_PB).unwrap();
+    let desc = pool.get_message_by_name(type_name).unwrap();
+    DynamicMessage::decode(desc, bytes).unwrap()
+}
 
-    let reply = if is_echo {
-        deframe(&request_body) // echo the request message verbatim
+/// Build a `HelloReply { message }` as protobuf bytes.
+fn hello_reply(message: String) -> Bytes {
+    let pool = DescriptorPool::decode(GREETER_PB).unwrap();
+    let desc = pool.get_message_by_name("greeter.v1.HelloReply").unwrap();
+    let mut msg = DynamicMessage::new(desc);
+    msg.set_field_by_name("message", Value::String(message));
+    Bytes::from(msg.encode_to_vec())
+}
+
+fn str_field(msg: &DynamicMessage, name: &str) -> String {
+    msg.get_field_by_name(name)
+        .map(|v| v.as_str().unwrap_or("").to_owned())
+        .unwrap_or_default()
+}
+
+/// Backend dispatcher that echoes request fields into the reply so tests can
+/// assert exactly what the gateway bound from path/body/query:
+/// - `/SayHello` → `HelloReply { message: "hello {name}" }`
+/// - `/UpdateGreeting` → `HelloReply { message: "{name}: {greeting}" }`
+/// - `/Search` → `SearchResponse { result: HelloReply { message:
+///   "{category}/{q}/{limit}" } }`
+/// - `/Echo` → echoes the framed request message verbatim
+/// - anything else → `PingReply { pong: "pong!" }`
+async fn handle(req: Request<Incoming>) -> Result<Response<FrameList>, Infallible> {
+    let path = req.uri().path().to_owned();
+    let request_body = req.into_body().collect().await.unwrap().to_bytes();
+    let msg = deframe(&request_body);
+
+    let reply = if path.ends_with("/Echo") {
+        msg // echo verbatim
+    } else if path.ends_with("/SayHello") {
+        let req = decode_msg("greeter.v1.HelloRequest", &msg);
+        hello_reply(format!("hello {}", str_field(&req, "name")))
+    } else if path.ends_with("/UpdateGreeting") {
+        let req = decode_msg("greeter.v1.UpdateGreetingRequest", &msg);
+        hello_reply(format!(
+            "{}: {}",
+            str_field(&req, "name"),
+            str_field(&req, "greeting")
+        ))
+    } else if path.ends_with("/Search") {
+        let req = decode_msg("greeter.v1.SearchRequest", &msg);
+        let category = str_field(&req, "category");
+        let q = str_field(&req, "q");
+        let limit = req
+            .get_field_by_name("limit")
+            .and_then(|v| v.as_i32())
+            .unwrap_or(0);
+        // SearchResponse { result: HelloReply { message } }
+        let pool = DescriptorPool::decode(GREETER_PB).unwrap();
+        let resp_desc = pool
+            .get_message_by_name("greeter.v1.SearchResponse")
+            .unwrap();
+        let inner_desc = pool.get_message_by_name("greeter.v1.HelloReply").unwrap();
+        let mut inner = DynamicMessage::new(inner_desc);
+        inner.set_field_by_name("message", Value::String(format!("{category}/{q}/{limit}")));
+        let mut resp = DynamicMessage::new(resp_desc);
+        resp.set_field_by_name("result", Value::Message(inner));
+        Bytes::from(resp.encode_to_vec())
     } else {
         ping_reply("pong!")
     };
@@ -221,23 +279,88 @@ async fn unknown_route_returns_404() {
 }
 
 #[tokio::test]
-async fn field_body_selector_returns_501() {
-    let gateway = gateway_offline();
-    // UpdateGreeting carries `body: "greeting"` (a field selector) on the
-    // literal annotated path — deferred to M2, so the gateway answers 501.
+async fn path_variable_binds_and_routes() {
+    // GET /v1/greeter/{name} → HelloRequest.name = "alice", echoed back.
+    let (gateway, _backend) = gateway_to_backend().await;
+    let resp = gateway
+        .handle("GET", "/v1/greeter/alice", &HeaderMap::new(), Bytes::new())
+        .await;
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["message"], "hello alice");
+}
+
+#[tokio::test]
+async fn field_body_selector_with_path_var() {
+    // POST /v1/greeter/{name}/greeting with body: "greeting": the JSON body is
+    // the `greeting` field, while `name` comes from the path.
+    let (gateway, _backend) = gateway_to_backend().await;
     let resp = gateway
         .handle(
             "POST",
-            "/v1/greeter/{name}/greeting",
+            "/v1/greeter/ada/greeting",
             &HeaderMap::new(),
-            Bytes::from_static(b"{}"),
+            Bytes::from_static(br#""hi there""#),
         )
         .await;
 
-    assert_eq!(resp.status(), 501);
+    assert_eq!(resp.status(), 200);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["code"], 12); // UNIMPLEMENTED
+    assert_eq!(json["message"], "ada: hi there");
+}
+
+#[tokio::test]
+async fn additional_binding_patch_is_reachable() {
+    // The PATCH additional_binding on UpdateGreeting reaches the same method.
+    let (gateway, _backend) = gateway_to_backend().await;
+    let resp = gateway
+        .handle(
+            "PATCH",
+            "/v1/greeter/ada/greeting",
+            &HeaderMap::new(),
+            Bytes::from_static(br#""hello""#),
+        )
+        .await;
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["message"], "ada: hello");
+}
+
+#[tokio::test]
+async fn query_params_and_response_body() {
+    // GET /v1/search/{category}?q=..&limit=.. binds the path var + query params,
+    // and response_body: "result" narrows the reply to the inner HelloReply.
+    let (gateway, _backend) = gateway_to_backend().await;
+    let resp = gateway
+        .handle(
+            "GET",
+            "/v1/search/books?q=rust&limit=5",
+            &HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    // response_body unwrapped the SearchResponse to just `result` (HelloReply).
+    assert_eq!(json["message"], "books/rust/5");
+    assert!(json.get("result").is_none(), "response_body should unwrap");
+}
+
+#[tokio::test]
+async fn unmatched_template_path_returns_404() {
+    // A path that matches no template (extra segment) is a route miss.
+    let (gateway, _backend) = gateway_to_backend().await;
+    let resp = gateway
+        .handle("GET", "/v1/greeter/a/b/c", &HeaderMap::new(), Bytes::new())
+        .await;
+    assert_eq!(resp.status(), 404);
 }
 
 #[tokio::test]

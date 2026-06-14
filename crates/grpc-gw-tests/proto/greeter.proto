@@ -32,6 +32,15 @@ service Greeter {
   // Unannotated: reachable only via the synthesized default binding.
   rpc Ping(PingRequest) returns (PingReply) {}
 
+  // Annotated: GET with a path-template capture, query-parameter expansion
+  // (`q`, `limit`), and a `response_body` selector narrowing the reply.
+  rpc Search(SearchRequest) returns (SearchResponse) {
+    option (google.api.http) = {
+      get: "/v1/search/{category}"
+      response_body: "result"
+    };
+  }
+
   // Unannotated: echoes a Kitchen message back. Exercises the proto3-JSON
   // edge cases (int64-as-string, enums, nested/repeated/map, timestamp,
   // bytes) that matter for grpc-gateway parity.
@@ -55,6 +64,16 @@ message PingRequest {}
 
 message PingReply {
   string pong = 1;
+}
+
+message SearchRequest {
+  string category = 1;  // bound from the path template {category}
+  string q = 2;         // bound from the query string ?q=
+  int32 limit = 3;      // bound from the query string ?limit=
+}
+
+message SearchResponse {
+  HelloReply result = 1;  // response_body: "result" renders just this field
 }
 
 // A grab-bag of proto3 field kinds whose canonical JSON mapping is where

@@ -84,5 +84,8 @@ fn all_methods_present() {
         .filter(|m| m.service.ends_with("Greeter"))
         .map(|m| m.method.as_str())
         .collect();
-    assert_eq!(greeter, vec!["SayHello", "UpdateGreeting", "Ping", "Echo"]);
+    assert_eq!(
+        greeter,
+        vec!["SayHello", "UpdateGreeting", "Ping", "Search", "Echo"]
+    );
 }

@@ -72,6 +72,11 @@ struct RoutesArgs {
 struct CheckArgs {
     #[command(flatten)]
     load: LoadArgs,
+
+    /// Treat a shadowed (structurally overlapping) route as an error, not a
+    /// warning. Off by default, matching Go grpc-gateway's first-match routing.
+    #[arg(long)]
+    strict_routes: bool,
 }
 
 #[derive(Args)]
@@ -86,6 +91,11 @@ struct ServeArgs {
     /// Address to listen on for inbound JSON/HTTP requests.
     #[arg(short, long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
+
+    /// Reject shadowed (structurally overlapping) routes at startup instead of
+    /// letting the earlier-declared route win. Off by default (Go semantics).
+    #[arg(long)]
+    strict_routes: bool,
 }
 
 fn main() -> ExitCode {
@@ -113,6 +123,7 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
         .map_err(|e| format!("invalid backend address {:?}: {e}", args.backend))?;
     let unbound_methods = !args.load.no_unbound_methods;
     let listen = args.listen;
+    let strict_routes = args.strict_routes;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -125,6 +136,7 @@ fn run_serve(args: ServeArgs) -> Result<(), String> {
             .backend(client)
             .options(GatewayOptions {
                 unbound_methods,
+                strict_routes,
                 ..Default::default()
             })
             .build()
@@ -166,6 +178,7 @@ fn run_check(args: CheckArgs) -> Result<(), String> {
     let table = args.load.load()?;
 
     let mut problems = Vec::new();
+    let mut warnings = Vec::new();
 
     // Methods that resolved to zero bindings are unreachable. With unbound
     // defaults enabled this only happens for an annotated method whose rule
@@ -182,15 +195,35 @@ fn run_check(args: CheckArgs) -> Result<(), String> {
         }
     }
 
+    // Templates that fail to parse are always errors.
+    for route in &table.routes {
+        for binding in &route.bindings {
+            if let Err(e) = grpc_gw::PathTemplate::parse(&binding.http_path) {
+                problems.push(format!("{}: {e}", route.grpc_path));
+            }
+        }
+    }
+
+    // Exact duplicates are always errors; shadowing is a warning unless
+    // `--strict-routes` promotes it to an error.
     for conflict in table.conflicts() {
-        problems.push(format!("route conflict: {conflict}"));
+        if conflict.is_error(args.strict_routes) {
+            problems.push(format!("route conflict: {conflict}"));
+        } else {
+            warnings.push(format!("route shadowing: {conflict}"));
+        }
+    }
+
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
     }
 
     if problems.is_empty() {
         eprintln!(
-            "ok: {} method(s), {} binding(s), no conflicts",
+            "ok: {} method(s), {} binding(s), {} warning(s)",
             table.routes.len(),
-            table.binding_count()
+            table.binding_count(),
+            warnings.len(),
         );
         Ok(())
     } else {

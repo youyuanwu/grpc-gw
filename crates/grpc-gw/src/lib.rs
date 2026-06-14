@@ -25,7 +25,7 @@ pub use gateway::{
     serve_connection, BuildError, Gateway, GatewayBuilder, GatewayOptions, ServeError,
 };
 pub use proxy::{GrpcClient, GrpcReply, ProxyError};
-pub use routes::{BodySelector, Route, RouteBinding, RouteConflict, RouteTable};
+pub use routes::{BodySelector, ConflictKind, Route, RouteBinding, RouteConflict, RouteTable};
 pub use status::{Code, ErrorEnvelope};
 pub use template::{PathTemplate, TemplateError};
 pub use transcode::{
