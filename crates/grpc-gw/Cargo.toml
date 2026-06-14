@@ -29,10 +29,3 @@ hyper.workspace = true
 hyper-util.workspace = true
 tokio.workspace = true
 tonic.workspace = true
-
-[dev-dependencies]
-# The proxy/gateway integration tests stand up a minimal HTTP/2 gRPC backend
-# with hyper (no tonic server) to prove real wire interop, and a small h1
-# client to drive `serve_connection`.
-tokio = { version = "1", features = ["full"] }
-hyper = { version = "1", features = ["client"] }

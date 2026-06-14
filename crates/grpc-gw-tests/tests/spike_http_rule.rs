@@ -1,17 +1,13 @@
-//! Spike 0 verification: load the committed fixture descriptor set and assert
+//! Spike 0 verification: load the generated fixture descriptor set and assert
 //! that `google.api.http` annotations are extracted correctly — including the
 //! `body` selector, a custom-ish additional binding, and the unannotated
 //! method that has no rule.
 //!
-//! Regenerate the fixture with:
-//! ```sh
-//! protoc -I fixtures/proto --include_imports --include_source_info \
-//!     -o crates/grpc-gw/tests/fixtures/greeter.pb fixtures/proto/greeter.proto
-//! ```
+//! The descriptor set is built by this crate's `build.rs` (via `protoc`) and
+//! exposed as [`grpc_gw_tests::GREETER_PB`].
 
 use grpc_gw::{extract_http_rules, HttpPattern};
-
-const GREETER_PB: &[u8] = include_bytes!("fixtures/greeter.pb");
+use grpc_gw_tests::GREETER_PB;
 
 fn method<'a>(
     rules: &'a [grpc_gw::MethodHttp],
@@ -81,12 +77,12 @@ fn unannotated_method_has_no_rule() {
 }
 
 #[test]
-fn all_three_methods_present() {
+fn all_methods_present() {
     let rules = extract_http_rules(GREETER_PB).expect("descriptor set parses");
     let greeter: Vec<_> = rules
         .iter()
         .filter(|m| m.service.ends_with("Greeter"))
         .map(|m| m.method.as_str())
         .collect();
-    assert_eq!(greeter, vec!["SayHello", "UpdateGreeting", "Ping"]);
+    assert_eq!(greeter, vec!["SayHello", "UpdateGreeting", "Ping", "Echo"]);
 }

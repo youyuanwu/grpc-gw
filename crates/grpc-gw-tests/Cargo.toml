@@ -1,0 +1,29 @@
+[package]
+name = "grpc-gw-tests"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Test fixtures and integration tests for grpc-gw (not published)"
+publish = false
+
+[lib]
+name = "grpc_gw_tests"
+path = "src/lib.rs"
+
+# The crate's only job is to compile the proto fixtures into a FileDescriptorSet
+# at build time (via `build.rs` + `protoc`) and host the integration tests that
+# consume it — so the generated `.pb` is never checked into git, and the main
+# `grpc-gw` library carries no `protoc` build dependency.
+[dev-dependencies]
+grpc-gw = { path = "../grpc-gw" }
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+http-body-util = "0.1"
+prost.workspace = true
+prost-reflect.workspace = true
+bytes.workspace = true
+http.workspace = true
+serde_json.workspace = true

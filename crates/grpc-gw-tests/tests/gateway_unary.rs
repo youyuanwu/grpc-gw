@@ -27,7 +27,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
-const GREETER_PB: &[u8] = include_bytes!("fixtures/greeter.pb");
+use grpc_gw_tests::GREETER_PB;
 
 /// Prefix `payload` with the 5-byte gRPC frame header (uncompressed).
 fn frame(payload: &[u8]) -> Bytes {
@@ -64,21 +64,45 @@ fn ping_reply(pong: &str) -> Bytes {
     Bytes::from(msg.encode_to_vec())
 }
 
-/// Backend that answers every unary call with one framed `PingReply` + an OK
-/// trailer, regardless of the request.
-async fn handle(_req: Request<Incoming>) -> Result<Response<FrameList>, Infallible> {
+/// Strip the 5-byte gRPC frame header, returning the message payload.
+fn deframe(buf: &[u8]) -> Bytes {
+    assert!(buf.len() >= 5, "frame header present");
+    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    Bytes::copy_from_slice(&buf[5..5 + len])
+}
+
+/// Backend dispatcher: `/Echo` echoes the framed request message back with an
+/// OK trailer; everything else returns a `PingReply { pong: "pong!" }`.
+async fn handle(req: Request<Incoming>) -> Result<Response<FrameList>, Infallible> {
+    let is_echo = req.uri().path().ends_with("/Echo");
+    let request_body = req.into_body().collect().await.unwrap().to_bytes();
+
+    let reply = if is_echo {
+        deframe(&request_body) // echo the request message verbatim
+    } else {
+        ping_reply("pong!")
+    };
+
     let mut trailers = HeaderMap::new();
     trailers.insert("grpc-status", "0".parse().unwrap());
     let body = FrameList {
-        frames: vec![
-            Frame::data(frame(&ping_reply("pong!"))),
-            Frame::trailers(trailers),
-        ]
-        .into(),
+        frames: vec![Frame::data(frame(&reply)), Frame::trailers(trailers)].into(),
     };
     Ok(Response::builder()
         .header("content-type", "application/grpc+proto")
         .body(body)
+        .unwrap())
+}
+
+/// Backend that always replies with a non-OK trailers-only gRPC status.
+async fn handle_status(_req: Request<Incoming>) -> Result<Response<FrameList>, Infallible> {
+    Ok(Response::builder()
+        .header("content-type", "application/grpc+proto")
+        .header("grpc-status", "7") // PERMISSION_DENIED
+        .header("grpc-message", "nope")
+        .body(FrameList {
+            frames: Default::default(),
+        })
         .unwrap())
 }
 
@@ -90,6 +114,22 @@ async fn spawn_backend() -> SocketAddr {
             tokio::spawn(async move {
                 let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service_fn(handle))
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// Spawn a backend that always returns `PERMISSION_DENIED`.
+async fn spawn_status_backend() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service_fn(handle_status))
                     .await;
             });
         }
@@ -154,6 +194,79 @@ async fn empty_body_is_accepted_for_default_binding() {
         )
         .await;
     assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn kitchen_echo_round_trip_through_gateway() {
+    // End-to-end proto3-JSON type coverage: a populated Kitchen message goes
+    // JSON → request transcode → gRPC (echoed by the backend) → response
+    // transcode → canonical JSON, with all the tricky kinds intact.
+    let gateway = gateway_to_backend().await;
+
+    let input = br#"{
+        "i32": 7,
+        "i64": "9007199254740993",
+        "flag": true,
+        "text": "hi",
+        "blob": "aGVsbG8=",
+        "flavor": "SOUR",
+        "nested": { "label": "n", "count": 3 },
+        "tags": ["a", "b"],
+        "scores": { "x": 1 },
+        "at": "2026-06-13T12:00:00Z"
+    }"#;
+
+    let resp = gateway
+        .handle(
+            "POST",
+            "/greeter.v1.Greeter/Echo",
+            &HeaderMap::new(),
+            Bytes::from_static(input),
+        )
+        .await;
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["i32"], 7);
+    assert_eq!(json["i64"], "9007199254740993");
+    assert_eq!(json["flag"], true);
+    assert_eq!(json["text"], "hi");
+    assert_eq!(json["blob"], "aGVsbG8=");
+    assert_eq!(json["flavor"], "SOUR");
+    assert_eq!(json["nested"]["label"], "n");
+    assert_eq!(json["nested"]["count"], 3);
+    assert_eq!(json["tags"], serde_json::json!(["a", "b"]));
+    assert_eq!(json["scores"]["x"], 1);
+    assert_eq!(json["at"], "2026-06-13T12:00:00Z");
+}
+
+#[tokio::test]
+async fn non_ok_grpc_status_maps_to_http_error() {
+    // A backend PERMISSION_DENIED (7) must render as HTTP 403 with the
+    // Status-proto JSON envelope.
+    let addr = spawn_status_backend().await;
+    let client = GrpcClient::plaintext(format!("http://{addr}").parse().unwrap()).unwrap();
+    let gateway = Gateway::builder(GREETER_PB.to_vec())
+        .backend(client)
+        .build()
+        .expect("gateway builds");
+
+    let resp = gateway
+        .handle(
+            "POST",
+            "/greeter.v1.Greeter/Ping",
+            &HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+
+    assert_eq!(resp.status(), 403);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], 7); // PERMISSION_DENIED
+    assert_eq!(json["message"], "nope");
 }
 
 #[tokio::test]
