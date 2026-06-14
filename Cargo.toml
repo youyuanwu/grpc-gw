@@ -6,7 +6,7 @@ members = ["crates/grpc-gw", "crates/grpc-gw-tests"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/youyuanwu/grpc-gw"
-rust-version = "1.82"
+rust-version = "1.90"
 
 [workspace.dependencies]
 prost = "0.14"
