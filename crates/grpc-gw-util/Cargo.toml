@@ -1,0 +1,28 @@
+[package]
+name = "grpc-gw-util"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Co-hosting utilities for grpc-gw: serve a tonic gRPC service in-process over an in-memory pipe and obtain a tonic Channel (no OS socket)"
+
+[lib]
+name = "grpc_gw_util"
+path = "src/lib.rs"
+
+[dependencies]
+# `axum` (with `http2` for in-process h2c gRPC) powers `in_process_channel` via
+# stock `axum::serve`, and `Incoming` implements `axum::serve::Listener`.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "http2"] }
+bytes.workspace = true
+futures-core = "0.3"
+http.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tokio.workspace = true
+# `server` adds `tonic::transport::server::Connected`, which `ServerIo` impls so
+# the `Incoming` stream can feed `Server::serve_with_incoming`; `channel`
+# (inherited from the workspace dep) provides the client `Channel`/`Endpoint`.
+tonic = { workspace = true, features = ["server"] }
+tower.workspace = true

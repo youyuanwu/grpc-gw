@@ -23,7 +23,11 @@
 //!   a later M2 slice).
 
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use http::header::{HeaderName, CONTENT_TYPE};
@@ -585,7 +589,7 @@ where
 {
     let service = service_fn(move |req: Request<Incoming>| {
         let gateway = gateway.clone();
-        async move { Ok::<_, std::convert::Infallible>(dispatch(&gateway, req).await) }
+        async move { Ok::<_, Infallible>(dispatch(&gateway, req).await) }
     });
 
     hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
@@ -594,8 +598,37 @@ where
         .map_err(ServeError)
 }
 
-/// Adapt an `http::Request` into the parts [`Gateway::handle`] needs.
-async fn dispatch(gateway: &Gateway, req: Request<Incoming>) -> Response<Full<Bytes>> {
+/// [`Gateway`] is a [`tower::Service`] over any [`http::Request`] whose body is
+/// a [`hyper::body::Body`] of [`Bytes`] — so it drops straight into a tower or
+/// hyper stack, mounts on an axum router (e.g.
+/// `Router::new().fallback_service(gateway)`), or joins a tonic server's router
+/// via `tonic::service::Routes`. The reply is the same rendered
+/// `Response<Full<Bytes>>` as [`Gateway::handle`], and the call is infallible.
+impl<B> tower::Service<Request<B>> for Gateway
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+{
+    type Response = Response<Full<Bytes>>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<B>) -> Self::Future {
+        let gateway = self.clone();
+        Box::pin(async move { Ok(dispatch(&gateway, req).await) })
+    }
+}
+
+/// Adapt an `http::Request` into the parts [`Gateway::handle`] needs. Generic
+/// over the request body so it serves hyper's [`Incoming`], axum's `Body`, or
+/// any other [`hyper::body::Body`] of [`Bytes`].
+async fn dispatch<B>(gateway: &Gateway, req: Request<B>) -> Response<Full<Bytes>>
+where
+    B: hyper::body::Body<Data = Bytes>,
+{
     let (parts, body) = req.into_parts();
     let method = parts.method.as_str().to_owned();
     // Pass path *and* query so `handle` can do query-parameter field expansion.

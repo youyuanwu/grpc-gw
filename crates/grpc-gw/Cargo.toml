@@ -29,3 +29,4 @@ hyper.workspace = true
 hyper-util.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+tower.workspace = true
