@@ -14,7 +14,10 @@
 //! `lowerCamelCase` field names, enums as names, default-valued fields
 //! skipped); [`JsonOptions`] exposes the knobs grpc-gateway also exposes.
 
-use prost_reflect::{DeserializeOptions, DynamicMessage, MessageDescriptor, SerializeOptions};
+use prost_reflect::{
+    DeserializeOptions, DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, ReflectMessage,
+    SerializeOptions, Value,
+};
 
 /// JSON marshaling knobs, mirroring the subset of grpc-gateway's `JSONPb`
 /// options M1 supports. Defaults are the canonical proto3 JSON mapping.
@@ -123,4 +126,188 @@ pub fn encode_response_json(
     msg.serialize_with_options(&mut ser, &opts.serialize_options())
         .map_err(TranscodeError::ResponseJson)?;
     Ok(buf)
+}
+
+/// A failure binding a string value (from a path variable or query parameter)
+/// into a message field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindError {
+    /// The field path named a field that does not exist on the message.
+    UnknownField { path: String, field: String },
+    /// A non-leaf path component is not a message (cannot descend into it).
+    NotAMessage { path: String, field: String },
+    /// The value could not be coerced to the leaf field's proto type.
+    InvalidValue {
+        path: String,
+        kind: String,
+        value: String,
+    },
+    /// The leaf field's proto type is not supported for path/query binding
+    /// (e.g. `bytes`, nested `message`, or `map`).
+    UnsupportedField { path: String, kind: String },
+}
+
+impl std::fmt::Display for BindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BindError::UnknownField { path, field } => {
+                write!(f, "unknown field {field:?} in field path {path:?}")
+            }
+            BindError::NotAMessage { path, field } => {
+                write!(f, "field {field:?} in path {path:?} is not a message")
+            }
+            BindError::InvalidValue { path, kind, value } => {
+                write!(f, "cannot bind {value:?} to {kind} field {path:?}")
+            }
+            BindError::UnsupportedField { path, kind } => {
+                write!(f, "binding into {kind} field {path:?} is unsupported")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BindError {}
+
+/// How a binding interacts with a field that is already set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindMode {
+    /// Always set the value (path variables win over body/query).
+    Overwrite,
+    /// Only set if the field is currently unset (query fills, never overwrites).
+    FillIfUnset,
+}
+
+/// Bind a single string `value` into `msg` at `field_path`, descending through
+/// nested messages and coercing the value to the leaf field's proto type.
+///
+/// Repeated leaf fields **append**; singular leaf fields honour `mode`. Used for
+/// both path-variable binding ([`BindMode::Overwrite`]) and query-parameter
+/// expansion ([`BindMode::FillIfUnset`]).
+pub fn bind_field_path(
+    msg: &mut DynamicMessage,
+    field_path: &[String],
+    value: &str,
+    mode: BindMode,
+) -> Result<(), BindError> {
+    bind_inner(msg, field_path, field_path, value, mode)
+}
+
+fn bind_inner(
+    msg: &mut DynamicMessage,
+    full_path: &[String],
+    remaining: &[String],
+    value: &str,
+    mode: BindMode,
+) -> Result<(), BindError> {
+    let path_str = full_path.join(".");
+    let (head, rest) = remaining
+        .split_first()
+        .expect("field path is non-empty by construction");
+    let field =
+        msg.descriptor()
+            .get_field_by_name(head)
+            .ok_or_else(|| BindError::UnknownField {
+                path: path_str.clone(),
+                field: head.clone(),
+            })?;
+
+    if rest.is_empty() {
+        bind_leaf(msg, &field, &path_str, value, mode)
+    } else {
+        // Descend into a nested message field; `get_field_mut` materializes the
+        // default (an empty message) if the field is currently unset.
+        if !matches!(field.kind(), Kind::Message(_)) || field.is_list() || field.is_map() {
+            return Err(BindError::NotAMessage {
+                path: path_str,
+                field: head.clone(),
+            });
+        }
+        let child =
+            msg.get_field_mut(&field)
+                .as_message_mut()
+                .ok_or_else(|| BindError::NotAMessage {
+                    path: path_str.clone(),
+                    field: head.clone(),
+                })?;
+        bind_inner(child, full_path, rest, value, mode)
+    }
+}
+
+fn bind_leaf(
+    msg: &mut DynamicMessage,
+    field: &FieldDescriptor,
+    path_str: &str,
+    value: &str,
+    mode: BindMode,
+) -> Result<(), BindError> {
+    let kind = field.kind();
+    if field.is_map() {
+        return Err(BindError::UnsupportedField {
+            path: path_str.to_owned(),
+            kind: "map".to_owned(),
+        });
+    }
+    let coerced = coerce_scalar(&kind, value, path_str)?;
+    if field.is_list() {
+        match msg.get_field_mut(field) {
+            Value::List(list) => list.push(coerced),
+            other => *other = Value::List(vec![coerced]),
+        }
+    } else {
+        if mode == BindMode::FillIfUnset && msg.has_field(field) {
+            return Ok(());
+        }
+        msg.set_field(field, coerced);
+    }
+    Ok(())
+}
+
+/// Coerce a string to a scalar [`Value`] of the given proto [`Kind`].
+fn coerce_scalar(kind: &Kind, value: &str, path: &str) -> Result<Value, BindError> {
+    let invalid = || BindError::InvalidValue {
+        path: path.to_owned(),
+        kind: format!("{kind:?}").to_lowercase(),
+        value: value.to_owned(),
+    };
+    let v = match kind {
+        Kind::Bool => Value::Bool(match value {
+            "true" | "1" | "t" | "T" | "TRUE" | "True" => true,
+            "false" | "0" | "f" | "F" | "FALSE" | "False" => false,
+            _ => return Err(invalid()),
+        }),
+        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => {
+            Value::I32(value.parse().map_err(|_| invalid())?)
+        }
+        Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => {
+            Value::I64(value.parse().map_err(|_| invalid())?)
+        }
+        Kind::Uint32 | Kind::Fixed32 => Value::U32(value.parse().map_err(|_| invalid())?),
+        Kind::Uint64 | Kind::Fixed64 => Value::U64(value.parse().map_err(|_| invalid())?),
+        Kind::Float => Value::F32(value.parse().map_err(|_| invalid())?),
+        Kind::Double => Value::F64(value.parse().map_err(|_| invalid())?),
+        Kind::String => Value::String(value.to_owned()),
+        Kind::Enum(desc) => {
+            // Accept the enum value by number or by name (canonical proto3 JSON).
+            if let Ok(n) = value.parse::<i32>() {
+                Value::EnumNumber(n)
+            } else if let Some(v) = desc.get_value_by_name(value) {
+                Value::EnumNumber(v.number())
+            } else {
+                return Err(invalid());
+            }
+        }
+        Kind::Bytes => {
+            return Err(BindError::UnsupportedField {
+                path: path.to_owned(),
+                kind: "bytes".to_owned(),
+            })
+        }
+        Kind::Message(_) => {
+            return Err(BindError::UnsupportedField {
+                path: path.to_owned(),
+                kind: "message".to_owned(),
+            })
+        }
+    };
+    Ok(v)
 }

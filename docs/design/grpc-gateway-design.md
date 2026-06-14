@@ -879,7 +879,8 @@ transcoding.
    grpc-gateway, path templates (multi-segment), query expansion,
    `body`/`response_body` selectors, `additional_bindings`, and the
    [pluggable hooks](#pluggable-hooks) (marshaler, error handler, header
-   matchers, metadata).
+   matchers, metadata). **Path-template routing/binding slice:
+   [m2-path-templates.md](./m2-path-templates.md).**
 3. **M3 — Streaming.** Server-streaming → NDJSON, then SSE option, with inbound/
    outbound back-pressure and client-cancel propagation.
 4. **M4 — Ergonomics.** Observability (access logs, OpenTelemetry, Prometheus),
@@ -890,6 +891,7 @@ transcoding.
 
 - `tonic-rest` background: [docs/background/tonic-rest.md](../background/tonic-rest.md)
 - M1 buildable scope: [m1-scope.md](./m1-scope.md)
+- M2 path templates (routing & binding): [m2-path-templates.md](./m2-path-templates.md)
 - OpenAPI/Swagger generation: [openapi-generation.md](./openapi-generation.md)
 - [`prost`](https://crates.io/crates/prost) /
   [`prost-reflect`](https://crates.io/crates/prost-reflect)

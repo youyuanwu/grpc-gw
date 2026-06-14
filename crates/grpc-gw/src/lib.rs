@@ -17,6 +17,7 @@ pub mod gateway;
 pub mod proxy;
 pub mod routes;
 pub mod status;
+pub mod template;
 pub mod transcode;
 
 pub use descriptor::{extract_http_rules, DescriptorError, HttpPattern, HttpRule, MethodHttp};
@@ -26,4 +27,8 @@ pub use gateway::{
 pub use proxy::{GrpcClient, GrpcReply, ProxyError};
 pub use routes::{BodySelector, Route, RouteBinding, RouteConflict, RouteTable};
 pub use status::{Code, ErrorEnvelope};
-pub use transcode::{decode_request_body, encode_response_json, JsonOptions, TranscodeError};
+pub use template::{PathTemplate, TemplateError};
+pub use transcode::{
+    bind_field_path, decode_request_body, encode_response_json, BindError, BindMode, JsonOptions,
+    TranscodeError,
+};
