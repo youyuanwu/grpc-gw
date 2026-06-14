@@ -18,16 +18,32 @@ path = "src/lib.rs"
 # `.pb` is never checked into git, and the main `grpc-gw` library carries no
 # `protoc` build dependency. Because the lib (`src/backend.rs`) is the shared
 # test harness, the hyper/tokio stack lives in `[dependencies]`, not dev-deps.
+#
+# `build.rs` also generates typed tonic Greeter server/client stubs (via
+# `tonic-prost-build`) for the co-hosting integration test, which stands up a
+# real tonic server next to the dynamic gateway in one process. The generated
+# code references `tonic`, `tonic-prost` (the `ProstCodec`), and `prost`/
+# `prost-types`, so those are normal dependencies; `tower` provides `Steer` for
+# the single-port content-type front door.
 [dependencies]
 bytes.workspace = true
 http.workspace = true
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "tokio"] }
 tokio = { version = "1", features = ["full"] }
+# Full tonic (server + codegen runtime) for the co-hosting test's real gRPC
+# server. The main `grpc-gw` crate still depends on tonic with `channel` only.
+tonic = { version = "0.14", features = ["server", "codegen"] }
+tonic-prost = "0.14"
+prost.workspace = true
+prost-types.workspace = true
+tower = { version = "0.5", features = ["steer", "util"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 grpc-gw = { path = "../grpc-gw" }
 http-body-util = "0.1"
-prost.workspace = true
 prost-reflect.workspace = true
 serde_json.workspace = true

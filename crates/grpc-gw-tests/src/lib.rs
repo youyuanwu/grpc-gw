@@ -13,6 +13,13 @@ pub mod backend;
 
 pub use backend::{deframe, frame, Backend, FrameList};
 
+/// Typed tonic Greeter stubs (server + client) generated from
+/// `proto/greeter.proto` by `build.rs`. Used by the co-hosting integration test
+/// to run a real tonic gRPC server in the same process as the dynamic gateway.
+pub mod greeter {
+    tonic::include_proto!("greeter.v1");
+}
+
 /// The compiled `greeter.proto` fixture as a serialized `FileDescriptorSet`,
 /// built with `--include_imports` (so `google.api.http` and
 /// `google.protobuf.Timestamp` resolve in the pool).

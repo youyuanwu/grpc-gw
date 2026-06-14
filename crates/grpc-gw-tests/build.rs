@@ -4,6 +4,11 @@
 //! The result is consumed by `src/lib.rs` via `include_bytes!`, so the binary
 //! descriptor blob is generated on every build instead of being committed.
 //!
+//! It additionally generates typed tonic Greeter server/client stubs
+//! (`greeter.v1.rs` under `OUT_DIR`, via `tonic-prost-build`) consumed by the
+//! co-hosting integration test, which runs a real tonic gRPC server in the same
+//! process as the dynamic gateway.
+//!
 //! `protoc` must be on `PATH` (or pointed to by the `PROTOC` env var). It
 //! bundles the well-known types (`google/protobuf/*.proto`), so only our own
 //! `proto/` include path is needed; `--include_imports` makes the set
@@ -40,4 +45,14 @@ fn main() {
         status.success(),
         "`{protoc}` failed to build the descriptor set (exit: {status})"
     );
+
+    // Also generate typed tonic Greeter server/client stubs for the co-hosting
+    // integration test (a real tonic server next to the dynamic gateway). This
+    // uses tonic-prost-build's bundled protoc; it is independent of the raw
+    // descriptor set above (which the gateway loads dynamically).
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .compile_protos(&[proto_dir.join("greeter.proto")], &[proto_dir])
+        .expect("tonic-prost-build failed to generate Greeter stubs");
 }
