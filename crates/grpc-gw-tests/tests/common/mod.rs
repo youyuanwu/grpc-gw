@@ -21,69 +21,11 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use grpc_gw_tests::greeter::greeter_client::GreeterClient;
-use grpc_gw_tests::greeter::greeter_server::{Greeter, GreeterServer};
-use grpc_gw_tests::greeter::{
-    HelloReply, HelloRequest, PingReply, PingRequest, SearchRequest, SearchResponse,
-    UpdateGreetingRequest,
-};
+use grpc_gw_tests::greeter::greeter_server::GreeterServer;
 use grpc_gw_util::Incoming;
 
-/// A real tonic service. Each method echoes its request into the reply so the
-/// REST-side assertions can observe exactly what the gateway bound from the
-/// path/body/query (mirrors the fake backend used by the unary tests).
-#[derive(Default)]
-pub struct GreeterImpl;
-
-#[tonic::async_trait]
-impl Greeter for GreeterImpl {
-    async fn say_hello(
-        &self,
-        request: tonic::Request<HelloRequest>,
-    ) -> Result<tonic::Response<HelloReply>, tonic::Status> {
-        let name = request.into_inner().name;
-        Ok(tonic::Response::new(HelloReply {
-            message: format!("hello {name}"),
-        }))
-    }
-
-    async fn update_greeting(
-        &self,
-        request: tonic::Request<UpdateGreetingRequest>,
-    ) -> Result<tonic::Response<HelloReply>, tonic::Status> {
-        let req = request.into_inner();
-        Ok(tonic::Response::new(HelloReply {
-            message: format!("{}: {}", req.name, req.greeting),
-        }))
-    }
-
-    async fn ping(
-        &self,
-        _request: tonic::Request<PingRequest>,
-    ) -> Result<tonic::Response<PingReply>, tonic::Status> {
-        Ok(tonic::Response::new(PingReply {
-            pong: "pong!".to_owned(),
-        }))
-    }
-
-    async fn search(
-        &self,
-        request: tonic::Request<SearchRequest>,
-    ) -> Result<tonic::Response<SearchResponse>, tonic::Status> {
-        let req = request.into_inner();
-        Ok(tonic::Response::new(SearchResponse {
-            result: Some(HelloReply {
-                message: format!("{}/{}/{}", req.category, req.q, req.limit),
-            }),
-        }))
-    }
-
-    async fn echo(
-        &self,
-        request: tonic::Request<grpc_gw_tests::greeter::Kitchen>,
-    ) -> Result<tonic::Response<grpc_gw_tests::greeter::Kitchen>, tonic::Status> {
-        Ok(tonic::Response::new(request.into_inner()))
-    }
-}
+// Re-export the shared service impl so tests can `use common::GreeterImpl`.
+pub use grpc_gw_tests::GreeterImpl;
 
 /// A guard for a spawned server task with **graceful shutdown**.
 ///
