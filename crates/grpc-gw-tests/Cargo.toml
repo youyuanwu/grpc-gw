@@ -43,9 +43,13 @@ tower.workspace = true
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
-axum = { version = "0.8", features = ["http2"] }
 grpc-gw = { path = "../grpc-gw" }
 grpc-gw-util = { path = "../grpc-gw-util" }
 http-body-util = "0.1"
+openssl = "0.10"
 prost-reflect.workspace = true
+rcgen = "0.14"
 serde_json.workspace = true
+tokio-openssl = "0.6"
+# openssl TLS backend for the TLS-fronted co-hosting test.
+tonic-tls = { version = "0.7", default-features = false, features = ["openssl"] }

@@ -15,15 +15,18 @@ use bytes::Bytes;
 use http::header::CONTENT_TYPE;
 use http::Request;
 use http_body_util::{BodyExt, Full};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpStream;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 use grpc_gw_tests::greeter::greeter_client::GreeterClient;
-use grpc_gw_tests::greeter::greeter_server::Greeter;
+use grpc_gw_tests::greeter::greeter_server::{Greeter, GreeterServer};
 use grpc_gw_tests::greeter::{
     HelloReply, HelloRequest, PingReply, PingRequest, SearchRequest, SearchResponse,
     UpdateGreetingRequest,
 };
+use grpc_gw_util::Incoming;
 
 /// A real tonic service. Each method echoes its request into the reply so the
 /// REST-side assertions can observe exactly what the gateway bound from the
@@ -82,17 +85,88 @@ impl Greeter for GreeterImpl {
     }
 }
 
-/// A running co-hosted server. Dropping it aborts the `axum::serve` task (and
-/// thus all in-flight connections); the test owns the lifetime via this guard.
-pub struct Cohosted {
-    pub addr: SocketAddr,
-    pub accept: tokio::task::JoinHandle<()>,
+/// A guard for a spawned server task with **graceful shutdown**.
+///
+/// Call [`shutdown`](ServerHandle::shutdown) to signal the server (via the
+/// `oneshot` wired into `serve_with_incoming_shutdown`) and await a clean drain.
+/// If the guard is merely dropped, it still signals shutdown and then aborts the
+/// task as a fallback (a `Drop` can't await).
+pub struct ServerHandle {
+    shutdown: Option<oneshot::Sender<()>>,
+    handle: Option<JoinHandle<()>>,
 }
 
-impl Drop for Cohosted {
-    fn drop(&mut self) {
-        self.accept.abort();
+impl ServerHandle {
+    pub fn new(shutdown: oneshot::Sender<()>, handle: JoinHandle<()>) -> Self {
+        ServerHandle {
+            shutdown: Some(shutdown),
+            handle: Some(handle),
+        }
     }
+
+    /// Signal graceful shutdown and await the server task draining.
+    pub async fn shutdown(mut self) {
+        self.signal();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+
+    fn signal(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        self.signal();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// A running co-hosted server bound to `addr`. Call
+/// [`shutdown`](Cohosted::shutdown) for a graceful drain, or drop it (which
+/// signals shutdown then aborts as a fallback).
+pub struct Cohosted {
+    pub addr: SocketAddr,
+    server: ServerHandle,
+}
+
+impl Cohosted {
+    pub fn new(addr: SocketAddr, shutdown: oneshot::Sender<()>, handle: JoinHandle<()>) -> Self {
+        Cohosted {
+            addr,
+            server: ServerHandle::new(shutdown, handle),
+        }
+    }
+
+    /// Signal graceful shutdown and await the server task draining.
+    pub async fn shutdown(self) {
+        self.server.shutdown().await;
+    }
+}
+
+/// Serve `greeter` over an in-memory [`Incoming`] with tonic's HTTP/2 server and
+/// **graceful shutdown**, returning a [`ServerHandle`] guard. This is the
+/// in-process backend behind the gateway in the duplex/TLS co-hosting tests.
+pub fn spawn_inprocess_backend(
+    greeter: GreeterServer<GreeterImpl>,
+    incoming: Incoming,
+) -> ServerHandle {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(greeter)
+            .serve_with_incoming_shutdown(incoming, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+    ServerHandle::new(shutdown_tx, handle)
 }
 
 /// Open a typed tonic client to the co-hosted port (native gRPC over h2c).
@@ -102,7 +176,9 @@ pub async fn grpc_client(addr: SocketAddr) -> GreeterClient<tonic::transport::Ch
         .expect("tonic client connects")
 }
 
-/// Send one HTTP/1.1 request to the co-hosted port and return (status, body).
+/// Send one plaintext HTTP/2 (h2c) request to the co-hosted port and return
+/// (status, body). The co-hosted front is tonic's HTTP/2-only server, so REST
+/// JSON rides h2c on the same port as native gRPC.
 pub async fn rest_call(
     addr: SocketAddr,
     method: &str,
@@ -110,9 +186,10 @@ pub async fn rest_call(
     body: Bytes,
 ) -> (http::StatusCode, Bytes) {
     let stream = TcpStream::connect(addr).await.unwrap();
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .unwrap();
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+            .await
+            .unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
     });

@@ -1,13 +1,13 @@
 //! Co-hosting the dynamic gateway and a **real tonic gRPC server** in a single
-//! process, behind a single port — using **stock tonic + axum APIs**.
+//! process, behind a single port — using **stock tonic APIs**.
 //!
-//! The tonic `GreeterServer` is turned into a [`tonic::service::Routes`], which
-//! is just an [`axum::Router`]; the [`Gateway`] — itself a `tower::Service` — is
-//! mounted as that router's `fallback_service`. `axum::serve` runs the whole
-//! thing on one ephemeral port (h1 + h2 auto):
+//! The tonic `GreeterServer` is turned into a [`tonic::service::Routes`] (an
+//! `axum::Router`); the [`Gateway`] — itself a `tower::Service` — is mounted as
+//! that router's `fallback_service`, and the combined router is wrapped back
+//! into a `Routes` so tonic's own HTTP/2 server runs it on one ephemeral port:
 //!
 //! ```text
-//!             :PORT  (axum::serve, h1+h2 auto)
+//!             :PORT  (tonic Server, HTTP/2)
 //!                │
 //!          axum::Router  (path routing)
 //!        ┌───────┴────────────────┐
@@ -24,9 +24,10 @@
 //! path between JSON and gRPC and needs content-type steering, e.g.
 //! `tower::steer::Steer`.)
 //!
-//! The test drives the one port two ways — a typed tonic [`GreeterClient`]
-//! (native gRPC) and a hyper HTTP/1.1 JSON client (REST) — and the gateway's
-//! backend hop loops back into the same port.
+//! tonic's transport server is HTTP/2 only, so native gRPC and REST JSON both
+//! ride h2c on the one port. The test drives it two ways — a typed tonic
+//! [`GreeterClient`] (native gRPC) and an HTTP/2 JSON client (REST) — and the
+//! gateway's backend hop loops back into the same port.
 //!
 //! The in-memory backend variant (no loopback socket on the gRPC hop) lives in
 //! `cohosting_inprocess.rs`.
@@ -34,7 +35,8 @@
 mod common;
 
 use bytes::Bytes;
-use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tonic::transport::server::TcpIncoming;
 
 use grpc_gw::{Gateway, GatewayOptions, GrpcClient};
 use grpc_gw_tests::greeter::greeter_server::GreeterServer;
@@ -43,13 +45,15 @@ use grpc_gw_tests::GREETER_PB;
 
 use common::{grpc_client, rest_call, Cohosted, GreeterImpl};
 
-/// Stand up the co-hosted server with **stock tonic + axum APIs** and serve it
-/// on an ephemeral port. The tonic `GreeterServer` becomes a
-/// [`tonic::service::Routes`] (an [`axum::Router`]); the [`Gateway`] is the
-/// router's `fallback_service`. The gateway's backend hop dials that same port.
+/// Stand up the co-hosted server with **stock tonic APIs** and serve it on an
+/// ephemeral port. The tonic `GreeterServer` becomes a
+/// [`tonic::service::Routes`] (an `axum::Router`); the [`Gateway`] is the
+/// router's `fallback_service`, and the whole thing is wrapped back into a
+/// `Routes` and served by tonic's HTTP/2 server. The gateway's backend hop
+/// dials that same port.
 async fn spawn_cohosted() -> Cohosted {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let tcp = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).expect("bind tcp");
+    let addr = tcp.local_addr().expect("local addr");
 
     // The gateway dials the very port we're about to serve: its transcoded gRPC
     // call re-enters the router and is path-routed to the in-process tonic svc.
@@ -62,19 +66,26 @@ async fn spawn_cohosted() -> Cohosted {
 
     // `Routes` registers the gRPC method paths (`/greeter.v1.Greeter/*`) on an
     // axum router; mounting the gateway as `fallback_service` sends everything
-    // else (the REST `/v1/...` bindings) to the transcoder. No custom front
-    // door — just the regular axum routing table.
+    // else (the REST `/v1/...` bindings) to the transcoder. Wrapping the router
+    // back into `Routes` lets tonic's own server drive it.
     let app = tonic::service::Routes::new(GreeterServer::new(GreeterImpl))
         .into_axum_router()
         .fallback_service(gateway);
+    let routes = tonic::service::Routes::from(app);
 
-    // `axum::serve` runs h1 + h2 auto on the one port, so native gRPC (h2c) and
-    // REST (h1) share it — the same multiplexing the hand-rolled accept loop did.
+    // tonic's transport server is HTTP/2 only, so native gRPC (h2c) and REST
+    // JSON (h2c) share the one port over HTTP/2. A oneshot drives graceful
+    // shutdown via `serve_with_incoming_shutdown`.
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let accept = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = tonic::transport::Server::builder()
+            .serve_with_incoming_shutdown(routes, tcp, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
     });
 
-    Cohosted { addr, accept }
+    Cohosted::new(addr, shutdown_tx, accept)
 }
 
 #[tokio::test]
@@ -133,5 +144,8 @@ async fn cohosted_server_serves_grpc_and_rest_on_one_port() {
         .into_inner();
     assert_eq!(reply.message, "hello again");
 
-    drop(server);
+    // Graceful shutdown: drop the client so its connection closes, then signal
+    // the server and await a clean drain.
+    drop(client);
+    server.shutdown().await;
 }

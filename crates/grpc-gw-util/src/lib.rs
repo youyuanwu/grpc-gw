@@ -14,24 +14,26 @@
 //! generated tonic client) and the gRPC call rides an in-process pipe — only
 //! HTTP/2 framing and protobuf encode/decode, no OS socket.
 //!
-//! You decide how to run the service: `Incoming` implements both
-//! [`axum::serve::Listener`] (for `axum::serve`) and [`Stream`] (for
-//! `tonic::transport::Server::serve_with_incoming`), or drive it manually with
-//! [`Incoming::accept`]. For the raw client connector instead of a `Channel`,
-//! use [`in_process_transport`], which returns `(Incoming, Connector)`.
+//! You decide how to run the service: `Incoming` implements [`Stream`] (so it
+//! feeds `tonic::transport::Server::serve_with_incoming`), or you can drive it
+//! manually with [`Incoming::accept`]. For the raw client connector instead of
+//! a `Channel`, use [`in_process_transport`], which returns
+//! `(Incoming, Connector)`.
 //!
 //! ```no_run
 //! # async fn demo() {
 //! let (channel, incoming) = grpc_gw_util::in_process_channel();
 //!
-//! // Caller owns serving. `incoming` implements `axum::serve::Listener` and
-//! // `Stream`, so serve your gRPC service however you like, e.g. turn a
-//! // generated tonic server into an `axum::Router` and run it with
-//! // `axum::serve`:
+//! // Caller owns serving. `incoming` is a `Stream` of connections, so serve
+//! // your gRPC service over it with tonic's own server:
 //! //
-//! //   let app = tonic::service::Routes::new(my_server).into_axum_router();
-//! //   let server = tokio::spawn(axum::serve(incoming, app).into_future());
-//! //   // ... drop / `server.abort()` when done.
+//! //   let server = tokio::spawn(async move {
+//! //       tonic::transport::Server::builder()
+//! //           .add_service(my_server)
+//! //           .serve_with_incoming(incoming)
+//! //           .await
+//! //   });
+//! //   // ... `server.abort()` when done.
 //!
 //! // let backend = grpc_gw::GrpcClient::with_channel(channel);
 //! // ... build the gateway with `backend` ...
@@ -59,8 +61,7 @@ const DUPLEX_BUF: usize = 64 * 1024;
 ///
 /// Wraps a [`tokio::io::DuplexStream`] and implements [`AsyncRead`] +
 /// [`AsyncWrite`] plus tonic's [`Connected`], so an [`Incoming`] stream can be
-/// fed straight to `tonic::transport::Server::serve_with_incoming` or to
-/// `axum::serve` (via [`Incoming`]'s [`axum::serve::Listener`] impl), or served
+/// fed straight to `tonic::transport::Server::serve_with_incoming`, or served
 /// manually over hyper by wrapping it in [`TokioIo`].
 #[derive(Debug)]
 pub struct ServerIo(DuplexStream);
@@ -102,9 +103,8 @@ impl Connected for ServerIo {
 ///
 /// Each item is the server end of a fresh in-memory pipe created when the
 /// paired [`Connector`] dials. `Incoming` implements [`Stream`] of
-/// `io::Result<`[`ServerIo`]`>` (for
-/// `tonic::transport::Server::serve_with_incoming`) and
-/// [`axum::serve::Listener`] (for `axum::serve`); for manual serving use
+/// `io::Result<`[`ServerIo`]`>`, so it feeds
+/// `tonic::transport::Server::serve_with_incoming`; for manual serving use
 /// [`accept`](Incoming::accept).
 pub struct Incoming {
     rx: mpsc::UnboundedReceiver<ServerIo>,
@@ -123,26 +123,6 @@ impl Stream for Incoming {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx).map(|opt| opt.map(Ok))
-    }
-}
-
-impl axum::serve::Listener for Incoming {
-    type Io = ServerIo;
-    type Addr = ();
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        match self.rx.recv().await {
-            Some(io) => (io, ()),
-            // Every `Connector` clone has been dropped, so no further
-            // connections can arrive. `axum::serve` requires `accept` to never
-            // return an error or terminate, so park forever; the
-            // [`InProcessServer`] guard aborts this task on drop.
-            None => std::future::pending().await,
-        }
-    }
-
-    fn local_addr(&self) -> io::Result<Self::Addr> {
-        Ok(())
     }
 }
 
@@ -186,8 +166,8 @@ impl tower::Service<Uri> for Connector {
 /// so you can wire the two halves into the familiar server/client APIs
 /// yourself:
 ///
-/// - feed `incoming` to `tonic::transport::Server::serve_with_incoming` or to
-///   `axum::serve` (it implements [`axum::serve::Listener`]), and
+/// - feed `incoming` to `tonic::transport::Server::serve_with_incoming` (it
+///   implements [`Stream`]), and
 /// - feed `connector` to
 ///   [`Endpoint::connect_with_connector`](tonic::transport::Endpoint::connect_with_connector).
 ///
@@ -205,9 +185,8 @@ pub fn in_process_transport() -> (Incoming, Connector) {
 ///
 /// This is a convenience over [`in_process_transport`] for the common case
 /// where you want a ready-to-use client `Channel` rather than the raw
-/// [`Connector`]. The caller owns serving: feed `incoming` to `axum::serve`
-/// (it implements [`axum::serve::Listener`]),
-/// `tonic::transport::Server::serve_with_incoming` (it implements [`Stream`]),
+/// [`Connector`]. The caller owns serving: feed `incoming` to
+/// `tonic::transport::Server::serve_with_incoming` (it implements [`Stream`])
 /// or a manual accept loop ([`Incoming::accept`]) — and decides how to mount
 /// the service and when to stop (drop the serving task / its
 /// [`JoinHandle`](tokio::task::JoinHandle)).

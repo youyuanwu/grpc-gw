@@ -10,7 +10,7 @@
 //! ```text
 //!   gRPC client ──TCP──┐
 //!                      ▼
-//!   REST client ──TCP──► :PORT (axum::serve)
+//!   REST client ──TCP──► :PORT (tonic Server, HTTP/2)
 //!                          ├─ /pkg.Svc/* ───► tonic Greeter  (on the front)
 //!                          └─ else → gateway ──► gRPC client
 //!                                                  │ (in-memory duplex)
@@ -23,7 +23,8 @@
 mod common;
 
 use bytes::Bytes;
-use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tonic::transport::server::TcpIncoming;
 
 use grpc_gw::{Gateway, GatewayOptions, GrpcClient};
 use grpc_gw_tests::greeter::greeter_server::GreeterServer;
@@ -33,21 +34,28 @@ use grpc_gw_tests::GREETER_PB;
 use common::{grpc_client, rest_call, Cohosted, GreeterImpl};
 
 /// Serve a **co-hosted** front door (native gRPC + REST) for `gateway` on an
-/// ephemeral **TCP** port via stock tonic + axum. The provided `greeter` (a
-/// tonic `GreeterServer`) owns the gRPC method paths and `gateway` is the
-/// `fallback_service` for the REST surface. Unlike the socket-backed variant,
-/// the gateway's backend is wired to an in-memory pipe by the caller, so the
-/// only socket is the inbound one.
+/// ephemeral **TCP** port via stock tonic. The provided `greeter` (a tonic
+/// `GreeterServer`) owns the gRPC method paths and `gateway` is the
+/// `fallback_service` for the REST surface; the combined router is served by
+/// tonic's HTTP/2 server. Unlike the socket-backed variant, the gateway's
+/// backend is wired to an in-memory pipe by the caller, so the only socket is
+/// the inbound one.
 async fn spawn_rest_front(greeter: GreeterServer<GreeterImpl>, gateway: Gateway) -> Cohosted {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let tcp = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).expect("bind tcp");
+    let addr = tcp.local_addr().expect("local addr");
     let app = tonic::service::Routes::new(greeter)
         .into_axum_router()
         .fallback_service(gateway);
+    let routes = tonic::service::Routes::from(app);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let accept = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = tonic::transport::Server::builder()
+            .serve_with_incoming_shutdown(routes, tcp, async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
     });
-    Cohosted { addr, accept }
+    Cohosted::new(addr, shutdown_tx, accept)
 }
 
 #[tokio::test]
@@ -60,18 +68,10 @@ async fn cohosted_inprocess_duplex_backend_has_no_socket_hop() {
     // An in-memory duplex transport (no TCP). `in_process_channel` hands back
     // the client `Channel` plus the `Incoming` connection stream; the caller
     // decides how to serve it. `Incoming` is a `Stream` of connections, so we
-    // serve the shared `greeter` over it with tonic's own
-    // `Server::serve_with_incoming`. `inproc` is aborted at the end of the test.
+    // serve the shared `greeter` over it with tonic's own server (graceful
+    // shutdown wired in by the helper).
     let (channel, incoming) = grpc_gw_util::in_process_channel();
-    let inproc = tokio::spawn({
-        let greeter = greeter.clone();
-        async move {
-            let _ = tonic::transport::Server::builder()
-                .add_service(greeter)
-                .serve_with_incoming(incoming)
-                .await;
-        }
-    });
+    let inproc = common::spawn_inprocess_backend(greeter.clone(), incoming);
 
     // The gateway's backend rides that in-memory pipe, so a transcoded REST
     // request reaches gRPC without a second (loopback) TCP hop.
@@ -122,6 +122,10 @@ async fn cohosted_inprocess_duplex_backend_has_no_socket_hop() {
         .into_inner();
     assert_eq!(pong.pong, "pong!");
 
-    drop(front);
-    inproc.abort();
+    // Graceful shutdown: drop the client, then stop the front (which drops the
+    // gateway and its backend channel, closing the in-memory connection), then
+    // drain the in-process backend.
+    drop(client);
+    front.shutdown().await;
+    inproc.shutdown().await;
 }
