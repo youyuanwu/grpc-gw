@@ -20,7 +20,7 @@ jobs:
     name: build & test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # `protoc` is required by the grpc-gw-tests build script (it compiles the
       # proto fixtures into a descriptor set and generates the tonic stubs).
