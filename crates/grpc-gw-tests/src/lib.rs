@@ -17,6 +17,8 @@ pub use backend::{deframe, frame, Backend, FrameList};
 /// `proto/greeter.proto` by `build.rs`. Used by the co-hosting integration test
 /// to run a real tonic gRPC server in the same process as the dynamic gateway.
 pub mod greeter {
+    #![allow(clippy::double_must_use)]
+
     tonic::include_proto!("greeter.v1");
 }
 
